@@ -1,0 +1,59 @@
+# OpenBell configuration. Secrets go in .env, not here.
+# Fallback list, used only if the scanner is disabled or fails.
+symbols: [NVDA, AVGO, MRVL, INTC, AMD, CAT, MU, GOOGL, IBM, PLTR, CRWD, IONQ, BE]
+benchmark: SPY                # tracked for comparison, never traded
+starting_equity: 100000
+db_path: openbell.db
+
+risk:
+  risk_per_trade_pct: 0.5     # loss if the stop is hit, as % of equity
+  max_position_pct: 20        # largest single position, % of equity
+  max_gross_exposure_pct: 100
+  max_positions: 6
+  max_trades_per_day: 8
+  daily_loss_limit_pct: 2.0   # stop new entries and flatten intraday trades
+  slippage_bps: 2.0           # applied to every simulated fill
+
+intraday:                     # opening-range breakout, flat by the close
+  enabled: true
+  opening_range_minutes: 15
+  rvol_min: 1.2
+  target_r: 2.0
+  max_stop_atr: 0.5
+  no_entry_minutes_before_close: 60
+  flatten_minutes_before_close: 10
+
+swing:                        # trend pullback, held for days with an ATR trail
+  enabled: true
+  ema_fast: 20
+  ema_slow: 50
+  atr_period: 14
+  stop_atr: 2.0
+  trail_atr: 3.0
+  max_hold_days: 30           # calendar days
+
+scanner:                      # picks each day's watchlist before the open
+  enabled: true
+  universe_size: 400          # most liquid US stocks, rebuilt weekly
+  min_price: 10
+  min_dollar_volume: 50000000 # 20-day average, in dollars
+  min_rel_strength_pct: 0     # swing only: must have beaten the benchmark over 3 months
+  min_gap_pct: 1.0            # intraday: pre-market gap up that counts as in play
+  min_premarket_share: 0.005  # ...on pre-market volume of at least 0.5% of a normal day
+  candidates: 45              # shortlist the agent reviews
+  max_watchlist: 29           # live names per day (free stream allows 30 with SPY)
+  news_lookback_hours: 48
+  earnings_blackout_days: 3   # no new swing entry this close to a report
+
+agent:
+  enabled: true
+  model: claude-haiku-5-5
+
+feed:
+  feed: iex                   # iex = free real-time; sip = paid full market
+  stale_seconds: 45
+
+api:
+  host: 127.0.0.1             # dashboard is read-only and has no login; keep it local
+  port: 8000
+  display_tz: Asia/Jerusalem
