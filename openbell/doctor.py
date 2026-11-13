@@ -228,12 +228,12 @@ async def check_stream(cfg: Config, rep: Report, data: AlpacaData) -> None:
         r = await _ws_session(url, data.key, data.secret, {"trades": syms[:30], "bars": syms[:30]},
                               75 if is_open else 6)
         ok = r["auth"] and r["subscription"] and not r["errors"]
-        live = (f"; in 20s: {r['trades']} trades, {r['bars']} bars; sample {r['sample']}" if is_open
+        live = (f"; in 75s: {r['trades']} trades, {r['bars']} bars; sample {r['sample']}" if is_open
                 else "; market closed, so no prices expected (rerun during the session to see flow)")
         rep.add("PASS" if ok else "FAIL", "alpaca.stream_30",
                 f"login {r['auth']}, subscribed {r['subscription']}, errors {r['errors']}{live}")
         if is_open and ok and r["trades"] == 0:
-            rep.add("WARN", "alpaca.stream_flow", "market is open but no trades arrived in 20s")
+            rep.add("WARN", "alpaca.stream_flow", "market is open but no trades arrived in 75s")
     except Exception as e:
         rep.add("FAIL", "alpaca.stream_30", f"{type(e).__name__}: {e}")
         return

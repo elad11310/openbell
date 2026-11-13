@@ -2,3 +2,5 @@
 *.db
 __pycache__/
 .pytest_cache/
+.venv/
+Recovery_code_Alpaca.txt
