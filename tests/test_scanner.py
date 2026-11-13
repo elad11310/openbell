@@ -1,3 +1,23 @@
+"""Tests for the pre-market scanner and the agent gate, from pure functions up to the
+live runner's whole pre-market flow (with stubbed services).
+
+WHAT: * universe filters (`eligible_assets`, `rank_universe`);
+      * the numeric scan's SWING / INTRADAY routes, gap and news handling, the
+        relative-strength floor, the candidate cap and determinism;
+      * the gate (`apply_decisions`) with and without agent decisions;
+      * strict parsing of the agent's selection reply;
+      * engine rules that depend on the scan (earnings blackout, watchlist-only entries);
+      * the scan outcome bookkeeping in the journal;
+      * `LiveRunner.prepare` end to end, including every fallback path.
+HOW:  `series()` builds steady synthetic daily trends whose last bar can be overridden
+      to create a specific situation (a dip, a volume spike, a gap). For the runner
+      tests, `StubData`, `StubFinnhub` and `StubAgent` replace the network clients, and
+      `runner.utcnow` is patched to a fixed moment before the open.
+WHY:  The scanner decides what the engine is even allowed to look at, and its live path
+      depends on four outside services. These tests pin down its rules and prove that
+      every missing service (news, pre-market, agent, the whole scanner) degrades to a
+      sensible fallback instead of stopping the day.
+"""
 import asyncio
 from datetime import date, datetime, timedelta, timezone
 
@@ -19,6 +39,8 @@ D0 = datetime(2026, 6, 1, 12, tzinfo=UTC)
 
 def series(sym, n=90, start=100.0, step=0.5, vol=2e6, last=None):
     """Steady trend; `last` overrides the final bar as (o, h, l, c, v)."""
+    # Bar i: open start+step*i, range +-1 around it, close 0.5 above the open.
+    # With the defaults the last close is 100 + 0.5*89 + 0.5 = 145.0.
     bars = [Bar(sym, D0 + timedelta(days=i), start + step * i, start + step * i + 1,
                 start + step * i - 1, start + step * i + 0.5, vol) for i in range(n)]
     if last:
@@ -27,9 +49,11 @@ def series(sym, n=90, start=100.0, step=0.5, vol=2e6, last=None):
 
 
 def test_eligible_assets_drops_funds_and_odd_classes():
+    # `a(...)` = a valid NASDAQ common stock, with overrides to break one rule at a time.
     a = lambda **k: {"tradable": True, "status": "active", "exchange": "NASDAQ", "name": "Acme Inc", **k}
-    got = eligible_assets([a(symbol="ACME"), a(symbol="TQQQ", name="ProShares UltraPro QQQ"),
-                           a(symbol="BRK.B"), a(symbol="OTCX", exchange="OTC"),
+    got = eligible_assets([a(symbol="ACME"), a(symbol="TQQQ", name="ProShares UltraPro QQQ"),   # fund name
+                           a(symbol="BRK.B"),                                                   # share class
+                           a(symbol="OTCX", exchange="OTC"),                                    # wrong exchange
                            a(symbol="HALT", tradable=False), a(symbol="SPY", name="SPDR S&P 500 ETF Trust")])
     assert got == ["ACME"]
 
@@ -37,6 +61,9 @@ def test_eligible_assets_drops_funds_and_odd_classes():
 def test_rank_universe_applies_price_and_liquidity_floor():
     cfg = Config()
     cfg.scanner.universe_size = 2
+    # Average dollar volume (price x shares): BIG ~ $551M/day, MID ~ $110M, SMALL ~ $66M
+    # (passes the $50M floor but loses on the size-2 cap), THIN fails the floor, PENNY
+    # fails the $10 price floor despite huge volume.
     daily = {"BIG": series("BIG", 30, vol=5e6), "MID": series("MID", 30, vol=1e6),
              "SMALL": series("SMALL", 30, vol=6e5), "THIN": series("THIN", 30, vol=1e4),
              "PENNY": series("PENNY", 30, start=2, step=0.01, vol=9e7)}
@@ -45,7 +72,7 @@ def test_rank_universe_applies_price_and_liquidity_floor():
 
 def test_scan_finds_swing_and_intraday_candidates():
     cfg = Config()
-    bench = series("SPY", step=0.1)
+    bench = series("SPY", step=0.1)           # benchmark rising slowly
     daily = {
         # uptrend, yesterday dipped to the fast EMA and held: swing setup
         "PULL": series("PULL", last=(142, 143, 136, 138, 2e6)),
@@ -62,6 +89,7 @@ def test_scan_finds_swing_and_intraday_candidates():
     assert set(got) == {"PULL", "HOT", "TURN"}
     assert got["PULL"].kind == "SWING" and got["HOT"].kind == "INTRADAY" and got["TURN"].kind == "INTRADAY"
     assert got["TURN"].metrics["rs_3m_pct"] < 0 and got["HOT"].metrics["rvol"] == 3.0
+    # No pre-market or news data was passed: those metrics are empty, not invented.
     assert got["HOT"].metrics["gap_pct"] is None and got["HOT"].metrics["fresh_news"] is False
 
 
@@ -71,18 +99,19 @@ def test_scan_gap_and_news_routes():
     names = ["GAPUP", "NEWS", "OLDNEWS", "GAPDN", "THINGAP", "QUIET"]
     daily = {n: series(n) for n in names}                    # all dull yesterday, close 145.0
     daily["SPY"] = bench
-    close, dv = 145.0, 145.0 * 2e6
+    close, dv = 145.0, 145.0 * 2e6                           # price and a normal day's dollar volume
     pre = {"GAPUP": {"price": close * 1.04, "dollar_vol": dv * 0.05},     # +4% on 5% of a day's volume
            "GAPDN": {"price": close * 0.95, "dollar_vol": dv * 0.05},
            "THINGAP": {"price": close * 1.04, "dollar_vol": dv * 0.0001}, # gap on almost no volume
            "NEWS": {"price": close * 1.002, "dollar_vol": dv * 0.001},
            "QUIET": {"price": close, "dollar_vol": 0.0}}
-    since = D0 + timedelta(days=89, hours=8)
+    since = D0 + timedelta(days=89, hours=8)                 # "previous close" cut-off for fresh news
     news = {"NEWS": [(since + timedelta(hours=3), "NEWS wins contract")],
             "OLDNEWS": [(since - timedelta(hours=30), "OLDNEWS old story")],
-            "GAPDN": [(since + timedelta(hours=1), "GAPDN cuts guidance")]}
+            "GAPDN": [(since + timedelta(hours=1), "GAPDN cuts guidance")]}   # fresh, but gapping down
     got = {c.symbol: c for c in scan(cfg, daily, bench, pre, news, since) if c.kind != "SWING"}
     assert set(got) == {"GAPUP", "NEWS"}                     # gap down, thin gap, stale news: out
+    # A real gap outranks a headline (gap score up to 3 + volume, news adds 1).
     assert got["GAPUP"].rank < got["NEWS"].rank and got["GAPUP"].metrics["gap_pct"] == 4.0
     assert got["NEWS"].metrics["fresh_news"] and got["NEWS"].headlines == ["NEWS wins contract"]
     assert 5.0 <= got["GAPUP"].metrics["premarket_vol_pct_of_day"] < 5.5
@@ -93,6 +122,7 @@ def test_swing_keeps_the_strength_floor():
     weak = series("WEAK", step=0.05, last=(104.5, 105.2, 103, 104.9, 2e6))   # uptrend, but lags the benchmark
     bench = series("SPY", step=0.5)
     assert [c for c in scan(cfg, {"WEAK": weak}, bench) if c.kind in ("SWING", "BOTH")] == []
+    # Lower the floor and the same setup becomes a SWING candidate.
     cfg.scanner.min_rel_strength_pct = -100
     assert [c.kind for c in scan(cfg, {"WEAK": weak}, bench)] == ["SWING"]
 
@@ -101,6 +131,7 @@ def test_scan_respects_candidate_cap_and_is_deterministic():
     cfg = Config()
     cfg.scanner.candidates = 5
     bench = series("SPY", step=0.1)
+    # 12 "hot" names (big volume, wide range, strong close), all slightly different.
     daily = {f"H{i:02d}": series(f"H{i:02d}", step=0.3 + i * 0.02,
                                  last=(130, 140 + i, 129.5, 139.5 + i, 6e6)) for i in range(12)}
     a, b = scan(cfg, daily, bench), scan(cfg, daily, bench)
@@ -109,11 +140,13 @@ def test_scan_respects_candidate_cap_and_is_deterministic():
 
 
 def cands(n):
+    """n candidates C0..C(n-1), already in rank order."""
     return [Candidate(f"C{i}", "SWING", 10 - i, rank=i + 1) for i in range(n)]
 
 
 def test_gate_fallback_takes_top_ranked():
     cs = cands(5)
+    # decisions=None (agent unavailable): approve all, pick the top 3.
     assert apply_decisions(cs, None, 3, set()) == ["C0", "C1", "C2"]
     assert all(c.decision == "approve" for c in cs) and [c.picked for c in cs] == [True] * 3 + [False] * 2
 
@@ -124,14 +157,15 @@ def test_gate_agent_rejections_and_held_positions():
     assert picks == ["C1", "C3"]                      # C0 rejected, C2 already held, C3 undecided -> kept
     assert cs[0].decision == "reject" and cs[0].reason == "share offering" and not cs[0].picked
     assert cs[2].picked and "no decision" in cs[3].reason
-    assert apply_decisions(cands(3), {}, 0, set()) == []
+    assert apply_decisions(cands(3), {}, 0, set()) == []   # no free slots -> no new picks
 
 
 def test_parse_selection_is_strict():
+    # Only AAA survives: ZZZ was never asked about, BBB's "approve" is a string, not a bool.
     txt = 'ok {"decisions":{"AAA":{"approve":false,"reason":"offering"},"ZZZ":{"approve":true},' \
           '"BBB":{"approve":"yes"}}}'
     assert parse_selection(txt, ["AAA", "BBB"]) == {"AAA": (False, "offering")}
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError):                   # wrong shape -> error (caller falls back)
         parse_selection('{"picks": ["AAA"]}', ["AAA"])
 
 
@@ -142,12 +176,14 @@ def test_earnings_blackout_blocks_swing_only(tmp_path):
     e = Engine(cfg, j)
     o = datetime(2026, 11, 10, 14, 30, tzinfo=UTC)
     sess = Session(o.date(), o, o + timedelta(hours=6, minutes=30))
+    # Three identical swing setups that differ only in time to earnings.
     mk = lambda s, d: DailyContext(s, 100, 101, 99, 2.0, 99, 95, 1, 3, 2, swing_trigger=101.0,
                                    swing_reason="t", earnings_in_days=d)
     e.start_day(sess, {"SOON": mk("SOON", 2), "LATER": mk("LATER", 6), "NONE": mk("NONE", None)},
                 DayPlan(), ["SOON", "LATER", "NONE"])
     for s in ("SOON", "LATER", "NONE"):
         e.on_tick(Tick(s, o + timedelta(minutes=6), 101.2))
+    # 2 sessions <= blackout of 3 -> blocked; 6 sessions or unknown -> allowed.
     assert set(e.positions) == {"LATER", "NONE"}
     assert "earnings in 2" in j.rows("SELECT message FROM events WHERE kind='SKIP'")[0]["message"]
 
@@ -161,7 +197,7 @@ def test_engine_trades_only_todays_watchlist_but_manages_held(tmp_path):
     mk = lambda s: DailyContext(s, 100, 101, 99, 2.0, 99, 95, 1, 3, 2, swing_trigger=101.0, swing_reason="t")
     e.start_day(sess, {"IN": mk("IN"), "OUT": mk("OUT")}, DayPlan(), ["IN"])
     e.on_tick(Tick("IN", o + timedelta(minutes=6), 101.2))
-    e.on_tick(Tick("OUT", o + timedelta(minutes=6), 101.2))
+    e.on_tick(Tick("OUT", o + timedelta(minutes=6), 101.2))   # same setup, but not on the watchlist
     assert set(e.positions) == {"IN"}
     e.end_day()
     # next day IN is no longer picked, but its stop must still work
@@ -173,12 +209,13 @@ def test_engine_trades_only_todays_watchlist_but_manages_held(tmp_path):
 
 def test_scan_outcomes_and_stats(tmp_path):
     j = Journal(str(tmp_path / "t.db"))
-    bars = series("AAA", 12)
-    day = bars[5].ts.date().isoformat()
+    bars = series("AAA", 12)                       # AAA rises; BBB (below) falls
+    day = bars[5].ts.date().isoformat()            # pretend both were scanned on bar 5's day
     a, r = Candidate("AAA", "SWING", 1, rank=1), Candidate("BBB", "SWING", 1, rank=2, decision="reject")
     j.save_scan(day, [a, r], "agent")
     j.update_scan_outcomes({"AAA": bars, "BBB": series("BBB", 12, step=-0.5)})
     row = {x["symbol"]: x for x in j.scan_rows(day)}
+    # Base is the close BEFORE the scan day (bar 4); 1 day = bar 5, 5 days = bar 9.
     assert row["AAA"]["ret_1d"] == pytest.approx((bars[5].c / bars[4].c - 1) * 100)
     assert row["AAA"]["ret_5d"] == pytest.approx((bars[9].c / bars[4].c - 1) * 100)
     st = j.scan_stats()
@@ -187,6 +224,9 @@ def test_scan_outcomes_and_stats(tmp_path):
 
 # ---------------------------------------------------------------- live pre-market path with stubs
 class StubData:
+    """Stands in for AlpacaData: serves a fixed `daily` dict, counts asset calls, and can
+    simulate a news outage. Same async method names and signatures as the real client."""
+
     def __init__(self, daily, fail_news=False):
         self.daily, self.fail_news, self.asset_calls, self.pre = daily, fail_news, 0, None
 
@@ -201,13 +241,15 @@ class StubData:
     async def news_all(self, wanted, start, end, max_pages=40):
         if self.fail_news:
             return None
+        # A fresh headline for every HOT* name.
         return {s: [(end - timedelta(hours=2), f"{s} raises guidance")] for s in wanted if s.startswith("HOT")}
 
     async def premarket(self, symbols, start, now):
-        return self.pre
+        return self.pre                            # None unless a test sets it
 
 
 class StubFinnhub:
+    """HOTA reports tomorrow; everything is profitable."""
     async def earnings(self, start, days=14):
         return {"HOTA": start + timedelta(days=1)}
 
@@ -216,6 +258,7 @@ class StubFinnhub:
 
 
 class StubAgent:
+    """Approves everything except the symbols in `reject`, and remembers what it saw."""
     active = True
 
     def __init__(self, reject=()):
@@ -230,8 +273,10 @@ class StubAgent:
 
 
 def make_runner(tmp_path, monkeypatch, daily, **kw):
+    """A real LiveRunner whose network clients are swapped for the stubs above.
+    `slots` sets max_watchlist; other kwargs go to StubData."""
     from openbell import runner as R
-    monkeypatch.setenv("ALPACA_API_KEY", "k")
+    monkeypatch.setenv("ALPACA_API_KEY", "k")      # AlpacaData refuses to construct without keys
     monkeypatch.setenv("ALPACA_API_SECRET", "s")
     cfg = Config()
     cfg.db_path = str(tmp_path / "live.db")
@@ -249,9 +294,13 @@ def market(sess):
         bars = [Bar(sym, first + timedelta(days=i), 100 + step * i, 101 + step * i, 99 + step * i,
                     100.5 + step * i, 2e6) for i in range(n)]
         if last:
+            # Replace the last bar with a wide, strong-closing day on `last` volume.
             c = bars[-1].c
             bars[-1] = Bar(sym, bars[-1].ts, c - 5, c + 2, c - 5.5, c + 1.5, last)
         return bars
+    # HOTA..HOTF: uptrends getting steeper (0.40 .. 0.65 a day) with a high-volume day
+    # yesterday (4x..9x normal). Each qualifies as BOTH swing and intraday; the steepest
+    # trend has the best 3-month relative strength, so HOTF ranks 1st and HOTA 6th.
     d = {"HOT" + "ABCDEF"[i]: mk("HOT" + "ABCDEF"[i], 0.4 + 0.05 * i, last=(4 + i) * 2e6) for i in range(6)}
     d.update({"DULLA": mk("DULLA", -0.2), "DULLB": mk("DULLB", -0.3), "SPY": mk("SPY", 0.1)})
     return d
@@ -261,6 +310,7 @@ def test_live_premarket_scan_end_to_end(tmp_path, monkeypatch):
     sess = MarketCalendar().current_or_next(datetime(2026, 11, 10, 5, tzinfo=UTC))
     r = make_runner(tmp_path, monkeypatch, market(sess))
     r.agent = StubAgent(reject={"HOTF"})
+    # Freeze "now" at 30 minutes before the open.
     monkeypatch.setattr("openbell.runner.utcnow", lambda: sess.open - timedelta(minutes=30))
     asyncio.run(r.prepare(sess))
     rows = {x["symbol"]: x for x in r.journal.scan_rows()}
@@ -270,6 +320,7 @@ def test_live_premarket_scan_end_to_end(tmp_path, monkeypatch):
     assert r.engine.symbols == ["HOTE", "HOTD", "HOTC", "HOTB"]      # next four by rank
     assert rows["HOTA"]["decision"] == "approve" and not rows["HOTA"]["picked"]   # no slot left
     assert r.universe == r.engine.symbols + ["SPY"] and len(r.universe) <= 30
+    # Enrichment reached the journal: headlines, profitability, earnings.
     assert rows["HOTE"]["headlines"] == ["HOTE raises guidance"] and rows["HOTE"]["profitable"] == 1
     assert rows["HOTE"]["metrics"]["fresh_news"] and rows["HOTE"]["metrics"]["gap_pct"] is None
     assert rows["HOTA"]["earnings_in_days"] == 1
@@ -283,15 +334,18 @@ def test_live_premarket_scan_end_to_end(tmp_path, monkeypatch):
 def test_live_scan_survives_missing_agent_news_and_scanner_failure(tmp_path, monkeypatch):
     sess = MarketCalendar().current_or_next(datetime(2026, 11, 10, 5, tzinfo=UTC))
     monkeypatch.setattr("openbell.runner.utcnow", lambda: sess.open - timedelta(minutes=30))
+    # Case 1: no news and no agent -> plain numeric ranking.
     r = make_runner(tmp_path, monkeypatch, market(sess), fail_news=True, slots=3)
     r.agent.select = lambda c: None                                  # agent unavailable
     asyncio.run(r.prepare(sess))
     assert r.engine.symbols == ["HOTF", "HOTE", "HOTD"]              # top-ranked
     assert r.journal.scan_rows()[0]["source"] == "rank"
 
+    # Case 2: the whole scanner fails (assets endpoint down) -> config's fallback list.
     async def boom():
         raise RuntimeError("assets endpoint down")
     r2 = make_runner(tmp_path / "..", monkeypatch, market(sess), slots=29)
+    # Point r2 at a fresh database file inside this test's temp folder.
     r2.cfg.db_path = str(tmp_path / "b.db")
     r2.journal = Journal(r2.cfg.db_path)
     r2.engine = Engine(r2.cfg, r2.journal)
@@ -328,6 +382,6 @@ def test_live_scan_uses_premarket_gap(tmp_path, monkeypatch):
     rows = {x["symbol"]: x for x in r.journal.scan_rows()}
     assert "HOTA" in r.engine.symbols and rows["HOTA"]["rank"] <= 2      # top of the intraday list
     assert rows["HOTA"]["metrics"]["gap_pct"] == 6.0
-    assert "HOTF" not in r.engine.symbols
+    assert "HOTF" not in r.engine.symbols                                # gapping down: dropped
     assert "pre-market data on, news on" in r.journal.rows(
         "SELECT message FROM events WHERE kind='SCAN'")[0]["message"]

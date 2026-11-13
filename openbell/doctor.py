@@ -1,7 +1,25 @@
 """`python -m openbell doctor` - check every outside service with your own keys.
 
 Prints a report you can paste to whoever supports the app. Keys are never printed.
-Nothing here places orders or changes anything on any account."""
+Nothing here places orders or changes anything on any account.
+
+WHAT: Runs a list of live checks and prints one PASS / WARN / FAIL / SKIP line each:
+        Alpaca    keys + market clock (and whether our calendar agrees), asset list,
+                  full-market daily history, which data plan the key is on, pre-market
+                  bars, regular-session minute bars, news, the websocket (30-symbol
+                  subscription, the 31st refused) and Alpaca's always-on test stream;
+        Finnhub   earnings calendar and company metrics (if a key is set);
+        Anthropic one real `select` call through the app's own prompt and parser.
+      Exit code 1 if anything FAILed, else 0.
+HOW:  Mostly raw HTTP/websocket calls (to see exactly what each service answers), plus
+      a few calls through the app's own client code (`data.bars`, `data.news_all`,
+      `parse_selection`) to prove the app parses real responses. Error details are
+      trimmed and any key that might appear in an error message is replaced with "***".
+WHY:  The code was built against published API documentation and a local fake server
+      (tests/fake_services.py), never against the real services. This command is the
+      real-world check: run it once with your keys before trusting a live session, and
+      again whenever something looks wrong.
+"""
 from __future__ import annotations
 
 import asyncio
@@ -19,18 +37,24 @@ from .finnhub import BASE as FINNHUB
 from .market_calendar import MarketCalendar, NY
 
 CLOCK_URL = "https://paper-api.alpaca.markets/v2/clock"
-TEST_STREAM = "wss://stream.data.alpaca.markets/v2/test"
+TEST_STREAM = "wss://stream.data.alpaca.markets/v2/test"   # sends fake trades 24/7
+# Liquid large caps used to pad the stream test past 30 symbols, to confirm the plan's
+# 30-symbol cap is enforced.
 FILLER = ["AAPL", "MSFT", "AMZN", "META", "TSLA", "JPM", "V", "XOM", "UNH", "HD", "PG", "MA", "COST",
           "ABBV", "KO", "PEP", "MRK", "WMT", "BAC", "CVX", "ORCL", "NFLX", "ADBE", "CSCO", "CRM", "TMO",
           "ACN", "LIN", "MCD", "DIS", "WFC", "ABT", "QCOM", "TXN", "DHR", "INTU", "AMGN", "PM", "NEE"]
 
 
 class Report:
+    """Collects check results and prints each one as soon as it is added."""
+
     def __init__(self) -> None:
         self.rows: list = []
 
     def add(self, status: str, name: str, detail: str) -> None:
+        # Collapse whitespace/newlines and cap the length so each check is one tidy line.
         self.rows.append((status, name, " ".join(str(detail).split())[:230]))
+        # flush=True: show progress immediately; some checks take several seconds.
         print(f"[{status:4}] {name}: {self.rows[-1][2]}", flush=True)
 
     def counts(self) -> dict:
@@ -38,6 +62,7 @@ class Report:
 
 
 def _iso(dt: datetime) -> str:
+    """Datetime -> the "YYYY-MM-DDTHH:MM:SSZ" format Alpaca expects."""
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
@@ -53,15 +78,20 @@ async def check_alpaca(cfg: Config, rep: Report) -> None:
     cal, now = MarketCalendar(), datetime.now(timezone.utc)
     nxt = cal.current_or_next(now)
     # the most recent session that has fully finished
+    # (sessions in the last 10 days, keep those already closed, take the last one;
+    # 10 days is enough to span any holiday cluster)
     done = [s for s in cal.sessions_between(now.date() - timedelta(days=10), now.date()) if s.close < now][-1]
     async with httpx.AsyncClient(timeout=60, headers=data.headers) as c:
         # 1. keys + clock
         r = await c.get(CLOCK_URL)
         if r.status_code != 200:
+            # Without valid keys every other check would fail too; stop here.
             rep.add("FAIL", "alpaca.auth", _err(r) + " | are these PAPER keys?")
             return
         ck = r.json()
         theirs = datetime.fromisoformat(ck["next_open"]).astimezone(timezone.utc)
+        # Alpaca's "next_open" is the NEXT open even while the market is open now, so if
+        # a session is in progress compare against the session after it.
         ours = nxt.open if now < nxt.open else cal.current_or_next(nxt.close + timedelta(minutes=1)).open
         same = abs((theirs - ours).total_seconds()) < 60
         rep.add("PASS" if same else "WARN", "alpaca.clock",
@@ -74,6 +104,7 @@ async def check_alpaca(cfg: Config, rep: Report) -> None:
             assets = r.json()
             ok = scanner.eligible_assets(assets)
             ex = sorted({a.get("exchange") for a in assets})
+            # Thousands of US stocks should pass; far fewer suggests a filter/field mismatch.
             rep.add("PASS" if len(ok) > 1000 else "WARN", "alpaca.assets",
                     f"{len(assets)} listings, {len(ok)} pass the stock filter; exchanges {ex}")
         else:
@@ -81,6 +112,7 @@ async def check_alpaca(cfg: Config, rep: Report) -> None:
 
         # 3. full-market daily history (the scanner and swing rules depend on it)
         async def bars(feed, tf, start, end, syms="SPY,NVDA"):
+            """Raw bars request (helper used by checks 3-6)."""
             return await c.get(DATA_URL, params={"symbols": syms, "timeframe": tf, "start": _iso(start),
                                                  "end": _iso(end), "limit": 10000, "adjustment": "all",
                                                  "feed": feed, "sort": "asc"})
@@ -91,6 +123,7 @@ async def check_alpaca(cfg: Config, rep: Report) -> None:
                     f"full-market daily bars over 30 days: {n}")
         else:
             rep.add("FAIL", "alpaca.daily_sip", _err(r))
+        # Same data again, through the app's own client, to prove parsing works.
         try:
             got = await data.bars(["SPY"], "1Day", now - timedelta(days=30), now - timedelta(hours=12), "sip")
             rep.add("PASS", "alpaca.parse_bars", f"app parsed {len(got['SPY'])} bars; last {got['SPY'][-1]}")
@@ -103,6 +136,8 @@ async def check_alpaca(cfg: Config, rep: Report) -> None:
                 else f"recent full-market data refused ({r.status_code}): free plan, as expected")
 
         # 5. pre-market bars in the delayed full-market feed (the gap scan depends on it)
+        # Use today's pre-market if at least 30 minutes of it are already 16+ minutes old
+        # (the free-plan delay); otherwise use the last completed session's pre-market.
         day = nxt.day if (now - timedelta(minutes=16)) > datetime.combine(
             nxt.day, time(4, 30), tzinfo=NY).astimezone(timezone.utc) else done.day
         pm_start = datetime.combine(day, time(4, 0), tzinfo=NY).astimezone(timezone.utc)
@@ -136,6 +171,7 @@ async def check_alpaca(cfg: Config, rep: Report) -> None:
             rep.add("PASS" if items else "WARN", "alpaca.news",
                     f"{len(items)} articles on first page of last 48h; more pages: "
                     f"{bool(r.json().get('next_page_token'))}; fields {keys}")
+            # Through the app's own parser, capped at 6 pages to keep the check quick.
             got = await data.news_all({"NVDA", "AAPL", "TSLA", "AMD", "MSFT"}, now - timedelta(hours=48), now, 6)
             rep.add("PASS" if got is not None else "FAIL", "alpaca.parse_news",
                     "app parsed headlines for " + str({k: len(v) for k, v in (got or {}).items()}))
@@ -146,7 +182,10 @@ async def check_alpaca(cfg: Config, rep: Report) -> None:
 
 
 async def _ws_session(url: str, key: str, secret: str, sub: dict, listen: float) -> dict:
-    """Connect, log in, subscribe; return what the server said."""
+    """Connect, log in, subscribe; return what the server said.
+
+    Same protocol as AlpacaData.stream, but it only counts and records messages for
+    `listen` seconds instead of yielding them, so the report can describe what happened."""
     out = {"auth": None, "subscription": None, "errors": [], "trades": 0, "bars": 0, "sample": None}
     async with websockets.connect(url, open_timeout=15) as ws:
         await ws.send(json.dumps({"action": "auth", "key": key, "secret": secret}))
@@ -155,6 +194,7 @@ async def _ws_session(url: str, key: str, secret: str, sub: dict, listen: float)
         sent = False
         while loop.time() < end:
             try:
+                # Wait only as long as the listening window has left (at least 0.1 s).
                 raw = await asyncio.wait_for(ws.recv(), timeout=max(end - loop.time(), 0.1))
             except asyncio.TimeoutError:
                 break
@@ -166,24 +206,27 @@ async def _ws_session(url: str, key: str, secret: str, sub: dict, listen: float)
                         sent = True
                         await ws.send(json.dumps({"action": "subscribe", **sub}))
                 elif t == "subscription":
+                    # Record how many symbols the server confirmed per channel.
                     out["subscription"] = {k: len(v) for k, v in m.items() if isinstance(v, list) and v}
                 elif t == "error":
                     out["errors"].append(f"{m.get('code')} {m.get('msg')}")
                 elif t == "t":
                     out["trades"] += 1
-                    out["sample"] = out["sample"] or m
+                    out["sample"] = out["sample"] or m      # keep the first trade as a sample
                 elif t == "b":
                     out["bars"] += 1
     return out
 
 
 async def check_stream(cfg: Config, rep: Report, data: AlpacaData) -> None:
+    """Three websocket checks: 30 symbols accepted, a 31st refused, the test feed flows."""
     url = STREAM_URL.format(feed=cfg.feed.feed)
     syms = list(dict.fromkeys(cfg.symbols + [cfg.benchmark] + FILLER))
     is_open = MarketCalendar().is_open(datetime.now(timezone.utc))
     try:
+        # Listen longer while the market is open, when real trades should arrive.
         r = await _ws_session(url, data.key, data.secret, {"trades": syms[:30], "bars": syms[:30]},
-                              20 if is_open else 6)
+                              75 if is_open else 6)
         ok = r["auth"] and r["subscription"] and not r["errors"]
         live = (f"; in 20s: {r['trades']} trades, {r['bars']} bars; sample {r['sample']}" if is_open
                 else "; market closed, so no prices expected (rerun during the session to see flow)")
@@ -196,6 +239,8 @@ async def check_stream(cfg: Config, rep: Report, data: AlpacaData) -> None:
         return
     await asyncio.sleep(2)            # the free plan allows one connection at a time
     try:
+        # 31 symbols: the free plan should refuse; if it accepts, the cap is higher.
+        # Either answer PASSes; the point is to learn which plan this key is on.
         r = await _ws_session(url, data.key, data.secret, {"trades": syms[:31]}, 6)
         if r["errors"]:
             rep.add("PASS", "alpaca.stream_31", f"31st symbol refused as expected: {r['errors']}")
@@ -225,6 +270,7 @@ async def check_finnhub(cfg: Config, rep: Report) -> None:
             rep.add("PASS" if rows else "WARN", "finnhub.earnings",
                     f"{len(rows)} reports in the next 14 days; sample {rows[0] if rows else None}")
         else:
+            # Finnhub takes the key as a URL parameter, so it can be echoed in errors: mask it.
             rep.add("FAIL", "finnhub.earnings", _err(r).replace(cfg.finnhub_key, "***"))
         r = await c.get(f"{FINNHUB}/stock/metric", params={"symbol": "AAPL", "metric": "all",
                                                            "token": cfg.finnhub_key})
@@ -238,6 +284,8 @@ async def check_finnhub(cfg: Config, rep: Report) -> None:
 
 
 def check_anthropic(cfg: Config, rep: Report) -> None:
+    """One real model call with the app's own gate prompt and parser, on a tiny sample
+    designed to have an obvious answer (an offering headline should be rejected)."""
     if not cfg.anthropic_key:
         rep.add("SKIP", "anthropic", "ANTHROPIC_API_KEY not set (default plan, no reviews, ranked picks)")
         return
@@ -260,14 +308,18 @@ def check_anthropic(cfg: Config, rep: Report) -> None:
 
 
 async def run(cfg: Config) -> int:
+    """Run all checks in order, print a summary, return the process exit code."""
     rep = Report()
     print(f"OpenBell doctor {__version__} | python {platform.python_version()} | "
           f"{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} | feed={cfg.feed.feed}\n")
+    # Each service check is isolated: a crash in one is reported as a FAIL and the
+    # remaining checks still run.
     for name, coro in (("alpaca", check_alpaca(cfg, rep)), ("finnhub", check_finnhub(cfg, rep))):
         try:
             await coro
         except Exception as e:
             rep.add("FAIL", name, f"check crashed: {type(e).__name__}: {e}")
+    # The Anthropic client is synchronous; run it in a thread like the live app does.
     await asyncio.to_thread(check_anthropic, cfg, rep)
     c = rep.counts()
     print(f"\nSummary: {c['PASS']} passed, {c['WARN']} warnings, {c['FAIL']} failed, {c['SKIP']} skipped.")

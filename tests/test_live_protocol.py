@@ -1,3 +1,19 @@
+"""Protocol tests: the real network clients (Alpaca, Finnhub, doctor) against the local
+fake server in fake_services.py.
+
+WHAT: Checks that the clients paginate, parse timestamps and headlines, skip
+      filtered trades, raise FatalFeedError on bad keys and refused data, and that
+      `doctor` produces a full PASS report with good keys (and never prints a key) and
+      a FAIL with bad ones.
+HOW:  The `host` fixture starts the fake server once per module. The `wired` fixture
+      then (a) clears proxy environment variables so requests to 127.0.0.1 go direct,
+      (b) monkeypatches every URL constant in alpaca.py, doctor.py and finnhub.py to the
+      fake server, and (c) returns an AlpacaData client with the accepted key "good".
+      monkeypatch undoes all of this after each test.
+WHY:  This is the closest the test suite gets to the real services. It catches client
+      bugs (pagination, parsing, error handling) without keys or internet access. Whether
+      the real services behave like the fake is only proven by running `openbell doctor`.
+"""
 import asyncio
 from datetime import datetime, timedelta, timezone
 
@@ -16,16 +32,21 @@ UTC = timezone.utc
 
 @pytest.fixture(scope="module")
 def host():
+    """Start the fake server once for all tests in this file."""
     return fake_services.start()
 
 
 @pytest.fixture
 def wired(host, monkeypatch):
+    """Point every client at the fake server; return an AlpacaData with a good key."""
+    # A corporate proxy would intercept localhost requests; make sure none is used.
     for v in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
         monkeypatch.delenv(v, raising=False)
     monkeypatch.setenv("NO_PROXY", "127.0.0.1")
     urls = {"DATA_URL": f"http://{host}/v2/stocks/bars", "NEWS_URL": f"http://{host}/v1beta1/news",
             "ASSETS_URL": f"http://{host}/v2/assets", "STREAM_URL": f"ws://{host}/v2/{{feed}}"}
+    # doctor.py imported these names with `from .alpaca import ...`, so it holds its own
+    # copies; both modules must be patched.
     for k, v in urls.items():
         monkeypatch.setattr(alpaca, k, v)
         monkeypatch.setattr(doctor, k, v)
@@ -33,6 +54,7 @@ def wired(host, monkeypatch):
     monkeypatch.setattr(doctor, "TEST_STREAM", f"ws://{host}/v2/test")
     monkeypatch.setattr(doctor, "FINNHUB", f"http://{host}/api/v1")
     monkeypatch.setattr(finnhub, "BASE", f"http://{host}/api/v1")
+    # Make the fake clock report the same next open as our calendar (same logic as doctor).
     now = datetime.now(UTC)
     cal = MarketCalendar()
     nxt = cal.current_or_next(now)
@@ -45,6 +67,7 @@ def test_rest_clients_parse_and_paginate(wired):
     now = datetime.now(UTC)
 
     async def go():
+        # 3 symbols -> the fake splits them over two pages; all three must come back.
         bars = await wired.bars(["SPY", "NVDA", "AMD"], "1Day", now - timedelta(days=30),
                                 now - timedelta(hours=12), feed="sip")
         assert set(bars) == {"SPY", "NVDA", "AMD"} and all(len(v) >= 18 for v in bars.values())
@@ -53,14 +76,16 @@ def test_rest_clients_parse_and_paginate(wired):
             await wired.bars(["SPY"], "1Min", now - timedelta(minutes=5), now, feed="sip")
         assert len(await wired.assets()) == 1201
         news = await wired.news_all({"NVDA", "AAPL", "A"}, now - timedelta(hours=48), now)
+        # Headline whitespace is collapsed, page 2 is fetched, newest comes first.
         assert [h for _, h in news["NVDA"]] == ["NVDA raises guidance", "NVDA older item"]   # 2 pages
         assert news["NVDA"][0][0] > news["NVDA"][1][0] and "A" not in news      # round-up ignored
         assert news["AAPL"][0][1] == "AAPL and MSFT sign deal"
         pre = await wired.premarket(["NVDA", "AMD"], now - timedelta(hours=3), now)
         assert pre["NVDA"]["price"] > 0 and pre["NVDA"]["dollar_vol"] > 0
+        # Started 5 minutes ago: nothing is 16+ minutes old yet -> None.
         assert await wired.premarket(["NVDA"], now - timedelta(minutes=5), now) is None   # window too young
         fh = Finnhub("k")
-        assert list(await fh.earnings(now.date())) == ["NVDA"]
+        assert list(await fh.earnings(now.date())) == ["NVDA"]                  # "BAD" (no date) skipped
         return fh
     asyncio.run(go())
 
@@ -68,6 +93,7 @@ def test_rest_clients_parse_and_paginate(wired):
 def test_stream_yields_ticks_and_bars_and_stops(wired):
     async def go():
         got = []
+        # Stream for 3 seconds; the generator must stop on its own at `until`.
         async for ev in wired.stream(["NVDA", "AMD"], datetime.now(UTC) + timedelta(seconds=3)):
             got.append(ev)
         return got
@@ -83,6 +109,7 @@ def test_stream_bad_key_is_fatal(wired):
     async def go():
         async for _ in bad.stream(["NVDA"], datetime.now(UTC) + timedelta(seconds=5)):
             pass
+    # Auth error 402 must raise at once, not loop on reconnects.
     with pytest.raises(FatalFeedError):
         asyncio.run(go())
 
@@ -92,9 +119,10 @@ def test_doctor_full_run(wired, monkeypatch, capsys):
     monkeypatch.setenv("ALPACA_API_SECRET", "secret")
     monkeypatch.setenv("FINNHUB_API_KEY", "fh-secret-key")
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    # Pretend the market is closed so the stream checks use the short listening window.
     monkeypatch.setattr(doctor.MarketCalendar, "is_open", lambda self, now: False)
     code = asyncio.run(doctor.run(Config()))
-    out = capsys.readouterr().out
+    out = capsys.readouterr().out                 # everything doctor printed
     assert code == 0, out
     for name in ("alpaca.clock", "alpaca.assets", "alpaca.daily_sip", "alpaca.parse_bars", "alpaca.plan",
                  "alpaca.premarket", "alpaca.minute_iex", "alpaca.news", "alpaca.parse_news",
@@ -103,6 +131,7 @@ def test_doctor_full_run(wired, monkeypatch, capsys):
         assert f"[PASS] {name}" in out, (name, out)
     assert "free plan, as expected" in out and "31st symbol refused" in out
     assert "[SKIP] anthropic" in out and "0 failed" in out
+    # No secret may appear anywhere in the report.
     assert "fh-secret-key" not in out and "secret" not in out.replace("fh-secret-key", "")
 
 
@@ -111,5 +140,5 @@ def test_doctor_reports_bad_keys(wired, monkeypatch, capsys):
     monkeypatch.setenv("ALPACA_API_SECRET", "secret")
     monkeypatch.delenv("FINNHUB_API_KEY", raising=False)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
-    assert asyncio.run(doctor.run(Config())) == 1
+    assert asyncio.run(doctor.run(Config())) == 1          # exit code 1 = something failed
     assert "[FAIL] alpaca" in capsys.readouterr().out
