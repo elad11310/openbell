@@ -162,11 +162,15 @@ def test_gate_agent_rejections_and_held_positions():
 
 def test_parse_selection_is_strict():
     # Only AAA survives: ZZZ was never asked about, BBB's "approve" is a string, not a bool.
-    txt = 'ok {"decisions":{"AAA":{"approve":false,"reason":"offering"},"ZZZ":{"approve":true},' \
-          '"BBB":{"approve":"yes"}}}'
+    txt = ('{"decisions":[{"ticker":"AAA","approve":false,"reason":"offering"},'
+           '{"ticker":"ZZZ","approve":true,"reason":""},{"ticker":"BBB","approve":"yes","reason":""}]}')
     assert parse_selection(txt, ["AAA", "BBB"]) == {"AAA": (False, "offering")}
     with pytest.raises(ValueError):                   # wrong shape -> error (caller falls back)
         parse_selection('{"picks": ["AAA"]}', ["AAA"])
+    # The failure seen live: a reply cut off after a few decisions must raise, so the
+    # runner falls back to ranking instead of trusting a partial list.
+    with pytest.raises(ValueError):
+        parse_selection('{"decisions":[{"ticker":"AAA","approve":true,"reason":"ok"},{"ticker":"BB', ["AAA"])
 
 
 def test_earnings_blackout_blocks_swing_only(tmp_path):

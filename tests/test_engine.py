@@ -226,14 +226,18 @@ def test_plan_restricts_but_never_raises_risk(tmp_path):
         feed_opening_range(e, s)
         e.on_bar(bar(15, 100.5, 101.6, 100.4, 101.5, v=2000, sym=s))
     assert set(e.positions) == {"AAA"} and e.positions["AAA"].qty == 500   # not 2500
-    # parse_plan: an unknown regime becomes neutral, 7 is clamped to 1, an unknown
-    # ticker (ZZZ) is dropped, and the prose around the JSON is ignored.
-    p = parse_plan('noise {"regime":"panic","risk_multiplier":7,"symbols":{"ZZZ":{},"AAA":{"allow_swing":false}}}',
+    # parse_plan: an unknown regime becomes neutral, 7 is clamped to 1, and an unknown
+    # ticker (ZZZ) is dropped. (The schema cannot express these limits, so the parser does.)
+    p = parse_plan('{"regime":"panic","risk_multiplier":7,"summary":"","symbols":['
+                   '{"ticker":"ZZZ"},{"ticker":"AAA","allow_intraday":true,"allow_swing":false,"note":"x"}]}',
                    ["AAA"])
     assert (p.regime, p.risk_multiplier, list(p.symbols)) == ("neutral", 1.0, ["AAA"])
+    assert p.symbols["AAA"].allow_swing is False
     assert parse_plan('{"risk_multiplier": -3}', []).risk_multiplier == 0.0
-    with pytest.raises(ValueError):                    # no JSON at all -> error (caller falls back)
+    with pytest.raises(ValueError):                    # not JSON -> error (caller falls back)
         parse_plan("I think today looks fine", [])
+    with pytest.raises(ValueError):                    # cut-off JSON -> error, not a partial plan
+        parse_plan('{"regime":"risk_on","risk_multiplier":0.5,"symbols":[{"ticker":"AAA"', ["AAA"])
 
 
 def test_max_positions_and_stale_feed(tmp_path):

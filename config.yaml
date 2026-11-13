@@ -48,6 +48,7 @@ scanner:                      # picks each day's watchlist before the open
 agent:
   enabled: true
   model: claude-haiku-5-5
+  effort: medium              # how much the model thinks: low | medium | high | xhigh | max
 
 feed:
   feed: iex                   # iex = free real-time; sip = paid full market

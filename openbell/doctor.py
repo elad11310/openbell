@@ -291,18 +291,17 @@ def check_anthropic(cfg: Config, rep: Report) -> None:
         return
     try:
         import anthropic
-        from .agent import SELECT_SYSTEM, parse_selection
+        from .agent import SELECT_SCHEMA, SELECT_SYSTEM, build_request, parse_selection, reply_text
         client = anthropic.Anthropic(api_key=cfg.anthropic_key)
         sample = [{"ticker": "AAA", "rank": 1, "kind": "INTRADAY", "gap_pct": 4.2,
                    "headlines": ["AAA prices $500M secondary share offering"]},
                   {"ticker": "BBB", "rank": 2, "kind": "SWING", "rs_3m_pct": 12.0, "headlines": []}]
-        r = client.messages.create(model=cfg.agent.model, max_tokens=cfg.agent.max_tokens,
-                                   system=SELECT_SYSTEM, messages=[{"role": "user", "content": json.dumps(sample)}])
-        text = "".join(b.text for b in r.content if getattr(b, "type", "") == "text")
-        got = parse_selection(text, ["AAA", "BBB"])
+        # Same request the live gate sends: model, max_tokens, effort and the JSON schema.
+        r = client.messages.create(**build_request(cfg, SELECT_SYSTEM, json.dumps(sample), SELECT_SCHEMA))
+        got = parse_selection(reply_text(r), ["AAA", "BBB"])
         rep.add("PASS" if len(got) == 2 else "WARN", "anthropic.select",
-                f"model {cfg.agent.model}; decisions {got}; tokens in/out "
-                f"{r.usage.input_tokens}/{r.usage.output_tokens}")
+                f"model {cfg.agent.model}, effort {cfg.agent.effort}; decisions {got}; "
+                f"stop {r.stop_reason}; tokens in/out {r.usage.input_tokens}/{r.usage.output_tokens}")
     except Exception as e:
         rep.add("FAIL", "anthropic.select", f"{type(e).__name__}: {str(e).replace(cfg.anthropic_key, '***')}")
 

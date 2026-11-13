@@ -75,7 +75,10 @@ class AgentCfg:
     """The LLM that writes the day plan, screens scanner candidates and reviews the day."""
     enabled: bool = True
     model: str = "claude-haiku-5-5"
-    max_tokens: int = 2000
+    # Thinking is on by default on current models and its tokens count against this
+    # cap, so it must leave room for the full JSON reply (45 candidates) after thinking.
+    max_tokens: int = 16000
+    effort: str = "medium"               # low | medium | high | xhigh | max: depth of thinking
 
 
 @dataclass
@@ -194,7 +197,8 @@ def load_dotenv(path: str = ".env") -> None:
     p = Path(path)
     if not p.exists():
         return
-    for line in p.read_text().splitlines():
+    # Explicit UTF-8: the OS default code page varies by machine (see api.index).
+    for line in p.read_text(encoding="utf-8").splitlines():
         line = line.strip()
         if line and not line.startswith("#") and "=" in line:
             k, v = line.split("=", 1)
@@ -207,6 +211,6 @@ def load_config(path: str | None = "config.yaml") -> Config:
     cfg = Config()
     if path and Path(path).exists():
         # `or {}` handles an empty YAML file, which safe_load returns as None.
-        _merge(cfg, yaml.safe_load(Path(path).read_text()) or {})
+        _merge(cfg, yaml.safe_load(Path(path).read_text(encoding="utf-8")) or {})
     cfg.validate()
     return cfg

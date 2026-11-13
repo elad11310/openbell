@@ -55,7 +55,9 @@ def create_app(engine: Engine, journal: Journal, cfg: Config, info: dict) -> Fas
     @app.get("/", response_class=HTMLResponse)
     def index() -> str:
         # Re-read on every request, so editing the HTML needs no server restart.
-        return PAGE.read_text()
+        # The file is UTF-8 (it contains symbols like "✕"). Without an explicit encoding
+        # Python uses the OS code page (e.g. cp1255 on a Hebrew Windows), which fails.
+        return PAGE.read_text(encoding="utf-8")
 
     @app.get("/api/state")
     def state() -> dict:
