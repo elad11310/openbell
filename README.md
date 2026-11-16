@@ -163,6 +163,9 @@ python -m openbell sim --days 20 --serve    # no keys needed: synthetic data + d
 python -m openbell run      # live sessions, paper only; dashboard on http://127.0.0.1:8000
 ```
 
+Run `doctor` while `run` is stopped. The free plan allows one stream connection per
+account, so with `run` holding it, doctor's stream check fails.
+
 `run` is meant to stay up (systemd, Docker, a small VPS). It sleeps until 25 minutes
 before each open. If it restarts mid-session it rebuilds VWAP and the opening range
 from today's bars and restores positions, cash and the day's counters from SQLite.

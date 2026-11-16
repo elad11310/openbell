@@ -44,6 +44,8 @@ TEST_STREAM = "wss://stream.data.alpaca.markets/v2/test"   # sends fake trades 2
 FILLER = ["AAPL", "MSFT", "AMZN", "META", "TSLA", "JPM", "V", "XOM", "UNH", "HD", "PG", "MA", "COST",
           "ABBV", "KO", "PEP", "MRK", "WMT", "BAC", "CVX", "ORCL", "NFLX", "ADBE", "CSCO", "CRM", "TMO",
           "ACN", "LIN", "MCD", "DIS", "WFC", "ABT", "QCOM", "TXN", "DHR", "INTU", "AMGN", "PM", "NEE"]
+# Shown when a stream check fails: the most common cause is the app itself.
+ONE_CONNECTION = "free plan = ONE stream connection; is `openbell run` running? stop it, rerun"
 
 
 class Report:
@@ -167,7 +169,10 @@ async def check_alpaca(cfg: Config, rep: Report) -> None:
         # on the websocket are priced during the session (feeds.Poller)
         try:
             got = await data.latest_trades(["SPY", "NVDA", "AAPL"])
-            age = {s: f"{(now - t.ts).total_seconds() / 60:.0f} min ago" for s, t in got.items()}
+            # Ages from the current time, never below zero (the local clock can be a little
+            # behind Alpaca's).
+            at = datetime.now(timezone.utc)
+            age = {s: f"{max((at - t.ts).total_seconds(), 0) / 60:.0f} min ago" for s, t in got.items()}
             rep.add("PASS" if got else "WARN", "alpaca.latest_trades",
                     f"{len(got)} of 3 symbols on the {cfg.feed.feed} feed; last trade {age}")
         except Exception as e:
@@ -196,8 +201,20 @@ async def _ws_session(url: str, key: str, secret: str, sub: dict, listen: float)
     """Connect, log in, subscribe; return what the server said.
 
     Same protocol as AlpacaData.stream, but it only counts and records messages for
-    `listen` seconds instead of yielding them, so the report can describe what happened."""
-    out = {"auth": None, "subscription": None, "errors": [], "trades": 0, "bars": 0, "sample": None}
+    `listen` seconds instead of yielding them, so the report can describe what happened.
+    If the server drops the connection, what was received so far is still returned, with
+    the reason in "closed": the server's error message usually explains the drop."""
+    out = {"auth": None, "subscription": None, "errors": [], "trades": 0, "bars": 0, "sample": None,
+           "closed": None}
+    try:
+        await _ws_listen(url, key, secret, sub, listen, out)
+    except websockets.ConnectionClosed as e:
+        out["closed"] = f"{type(e).__name__}: {e}"
+    return out
+
+
+async def _ws_listen(url: str, key: str, secret: str, sub: dict, listen: float, out: dict) -> None:
+    """The body of _ws_session; fills `out` as messages arrive."""
     async with websockets.connect(url, open_timeout=15) as ws:
         await ws.send(json.dumps({"action": "auth", "key": key, "secret": secret}))
         loop = asyncio.get_running_loop()
@@ -226,7 +243,6 @@ async def _ws_session(url: str, key: str, secret: str, sub: dict, listen: float)
                     out["sample"] = out["sample"] or m      # keep the first trade as a sample
                 elif t == "b":
                     out["bars"] += 1
-    return out
 
 
 async def check_stream(cfg: Config, rep: Report, data: AlpacaData) -> None:
@@ -238,11 +254,14 @@ async def check_stream(cfg: Config, rep: Report, data: AlpacaData) -> None:
         # Listen longer while the market is open, when real trades should arrive.
         r = await _ws_session(url, data.key, data.secret, {"trades": syms[:30], "bars": syms[:30]},
                               75 if is_open else 6)
-        ok = r["auth"] and r["subscription"] and not r["errors"]
+        ok = r["auth"] and r["subscription"] and not r["errors"] and not r["closed"]
         live = (f"; in 75s: {r['trades']} trades, {r['bars']} bars; sample {r['sample']}" if is_open
                 else "; market closed, so no prices expected (rerun during the session to see flow)")
+        closed = f"; connection dropped ({r['closed']})" if r["closed"] else ""
+        # On failure the hint replaces the flow summary; report lines are cut at 230 characters.
         rep.add("PASS" if ok else "FAIL", "alpaca.stream_30",
-                f"login {r['auth']}, subscribed {r['subscription']}, errors {r['errors']}{live}")
+                f"login {r['auth']}, subscribed {r['subscription']}, errors {r['errors']}{closed}"
+                + (live if ok else f" | {ONE_CONNECTION}"))
         if is_open and ok and r["trades"] == 0:
             rep.add("WARN", "alpaca.stream_flow", "market is open but no trades arrived in 75s")
     except Exception as e:
