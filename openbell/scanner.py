@@ -2,7 +2,7 @@
 
   universe (weekly)  ->  numeric scan (daily)  ->  news / earnings  ->  agent gate  ->  watchlist
 
-WHAT: Picks up to `max_watchlist` (29) symbols for the day out of the whole US market.
+WHAT: Picks up to `max_watchlist` (45) symbols for the day out of the whole US market.
         1. Universe:   `ensure_universe` keeps the ~400 most liquid common stocks,
                        rebuilt once a week (cached in the journal's `universe` table).
         2. Numeric scan: `scan` builds two ranked lists from daily bars, plus optional
@@ -19,9 +19,10 @@ WHAT: Picks up to `max_watchlist` (29) symbols for the day out of the whole US m
 HOW:  Steps 2 and 5 are pure functions (data in, list out, no network), which is what
       lets the replay and the simulation reuse them and makes them easy to test. Only
       `ensure_universe` performs I/O.
-WHY:  The free data stream allows only 30 symbols, so the app cannot watch the whole
-      market. The scan spends those slots on stocks where the strategies are most likely
-      to fire. The agent can only remove names (never add any), and being on the
+WHY:  Live data is limited (the free websocket takes 30 symbols; the rest of the
+      watchlist is polled, see feeds.py), so the app cannot watch the whole market. The
+      scan spends those slots on stocks where the strategies are most likely to fire,
+      and its rank order decides which names get the real-time stream. The agent can only remove names (never add any), and being on the
       watchlist triggers nothing by itself: entries still need the engine's rules.
 """
 from __future__ import annotations

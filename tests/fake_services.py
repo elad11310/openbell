@@ -3,6 +3,7 @@ It proves the client code is self-consistent; only `openbell doctor` proves it a
 
 WHAT: A FastAPI app that imitates the external endpoints the app calls:
         GET  /v2/clock, /v2/assets, /v2/stocks/bars   Alpaca REST
+        GET  /v2/stocks/trades/latest                  Alpaca latest trades (polling)
         GET  /v1beta1/news                             Alpaca news
         WS   /v2/iex, /v2/test                         Alpaca websocket stream
         GET  /api/v1/calendar/earnings, /stock/metric  Finnhub
@@ -11,7 +12,8 @@ HOW:  Each endpoint returns small, predictable data with deliberate traps that t
       clients must handle: pagination (bars and news are split over two pages),
       refused recent SIP data (HTTP 403), nanosecond timestamps, a news "round-up"
       tagged with 7 symbols, a trade with a condition code to skip ("W"), a bad API key,
-      and a 31-symbol subscription that must be refused.
+      and a 31-symbol subscription that must be refused. The websocket records every
+      subscribe / unsubscribe it receives in `app.state.ws_actions`.
       test_live_protocol.py points the clients' URL constants at this server.
 WHY:  The real services need keys and a network connection, and were not reachable when
       the app was built. This fake lets the HTTP and websocket client code (pagination,
@@ -28,6 +30,7 @@ import uvicorn
 from fastapi import FastAPI, Request, WebSocket
 
 app = FastAPI()
+app.state.ws_actions = []      # ("subscribe" | "unsubscribe", symbols) in arrival order
 UTC = timezone.utc
 
 
@@ -90,6 +93,15 @@ def bars(symbols: str, timeframe: str, start: str, end: str, feed: str = "iex", 
     return {"bars": {x: _bars(x, timeframe, s, e) for x in rest}, "next_page_token": None}
 
 
+@app.get("/v2/stocks/trades/latest")
+def latest_trades(symbols: str, feed: str = "iex"):
+    # One trade per symbol, a second old, with a 9-digit timestamp; any symbol called
+    # "ODD" carries condition "W" and must be left out by the client.
+    ts = (datetime.now(UTC) - timedelta(seconds=1)).strftime("%Y-%m-%dT%H:%M:%S.123456789Z")
+    return {"trades": {s: {"t": ts, "x": "V", "p": 100.0 + len(s), "s": 50, "i": 7, "z": "C",
+                           "c": ["@", "W"] if s == "ODD" else ["@"]} for s in symbols.split(",")}}
+
+
 @app.get("/v1beta1/news")
 def news(page_token: str = ""):
     now = datetime.now(UTC)
@@ -123,8 +135,11 @@ async def _stream(ws: WebSocket, fake: bool):
                 continue
             authed = True
             await ws.send_text(json.dumps([{"T": "success", "msg": "authenticated"}]))
+        elif m.get("action") == "unsubscribe" and authed:
+            app.state.ws_actions.append(("unsubscribe", m.get("trades")))
         elif m.get("action") == "subscribe" and authed:
             syms = m.get("trades") or []
+            app.state.ws_actions.append(("subscribe", syms))
             if len(syms) > 30:                    # free-plan symbol limit
                 await ws.send_text(json.dumps([{"T": "error", "code": 405, "msg": "symbol limit exceeded"}]))
                 continue

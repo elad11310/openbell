@@ -457,6 +457,26 @@ class Engine:
                               self.last.get(self.cfg.benchmark))
 
     # ------------------------------------------------------------ view
+    def can_still_enter(self, symbol: str) -> bool:
+        """Could `symbol` still produce a new entry today? Read-only.
+
+        True while its ORB attempt is unused and the entry cutoff has not passed, or while
+        its swing trigger is untried, as far as the plan and the day's limits allow.
+        The runner uses this to decide which names deserve the real-time stream (see
+        feeds.plan_feeds). It is not an entry check: on_tick and on_bar still apply
+        every rule."""
+        s, st = self.session, self.state.get(symbol)
+        if not s or st is None or self.halted or self.trades_today >= self.cfg.risk.max_trades_per_day:
+            return False
+        ic, sw, allow = self.cfg.intraday, self.cfg.swing, self.plan.for_symbol(symbol)
+        now = self.now or s.open
+        orb = (ic.enabled and allow.allow_intraday and not st.orb_taken
+               and now < s.close - timedelta(minutes=ic.no_entry_minutes_before_close))
+        c = self.ctx.get(symbol)
+        swing = (sw.enabled and allow.allow_swing and c is not None and c.swing_trigger is not None
+                 and (symbol, "SWING") not in self._attempted)
+        return bool(orb or swing)
+
     def snapshot(self) -> dict:
         """Everything the dashboard (and the agent's plan prompt) needs, as plain JSON
         types. Read-only: building it never changes engine state."""

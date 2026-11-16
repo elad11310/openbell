@@ -7,8 +7,12 @@ WHAT: `LiveRunner` is the conductor of `python -m openbell run`. It owns one of 
         2. scan for today's watchlist                        (build_watchlist)
         3. build daily contexts, ask the agent for a plan,
            start the engine's day                            (prepare)
-        4. stream live ticks and bars into the engine until
+        4. feed live ticks and bars into the engine until
            the close; watch for a silent feed                (trade)
+           The top names (positions first) come over the websocket, which takes
+           `feed.stream_limit` + the benchmark; the rest of the watchlist is polled
+           over REST every few seconds. Names move between the two during the day
+           as positions open (refresh_feeds; see feeds.py).
         5. close the day's books and ask for a review        (after_close)
       The read-only dashboard server runs alongside, on the same event loop, with a
       `ChartService` that fetches a symbol's bars from the same AlpacaData client when
@@ -40,6 +44,7 @@ from .api import create_app
 from .charts import ChartService
 from .config import Config
 from .engine import Engine
+from .feeds import EPOCH, Poller, completed_until, plan_feeds
 from .journal import Journal
 from .market_calendar import MarketCalendar, NY
 from .models import Tick, Session
@@ -75,8 +80,16 @@ class LiveRunner:
         self.data = AlpacaData(cfg.alpaca_key, cfg.alpaca_secret, cfg.feed.feed)  # raises if keys missing
         self.agent = Agent(cfg)                      # inactive without ANTHROPIC_API_KEY
         self.finnhub = Finnhub(cfg.finnhub_key)      # inactive without FINNHUB_API_KEY
-        # Symbols to stream: today's watchlist + benchmark (replaced every morning).
+        # Symbols with live data: today's watchlist + benchmark (replaced every morning).
         self.universe = list(dict.fromkeys(cfg.symbols + [cfg.benchmark]))
+        # How `universe` is split between the websocket and REST polling while trading.
+        # Both lists are changed in place; the stream and the poller re-read them, which
+        # is how a name moves from one source to the other (see refresh_feeds).
+        self.streamed: list = []
+        self.polled: list = []
+        # symbol -> start time of the last minute bar handed to the engine today, so a bar
+        # that arrives from both sources around a move is counted once (see deliver).
+        self.last_bar: dict = {}
         # Extra facts for the dashboard. The dict is shared with the API app, so updating
         # it here shows up on the next page refresh.
         self.info = {"next_session": None, "agent_active": self.agent.active}
@@ -211,6 +224,7 @@ class LiveRunner:
         self.engine.status = "scanning"
         watch, daily, earn = await self.build_watchlist(sess)
         self.universe = list(dict.fromkeys(watch + [self.cfg.benchmark]))
+        self.last_bar = {}
         ctx = contexts_for(self.cfg, {s: daily.get(s, []) for s in self.universe}, sess)
         for s, c in ctx.items():
             c.earnings_in_days = self._sessions_until(sess, earn.get(s))
@@ -230,54 +244,109 @@ class LiveRunner:
             # range (and marks ORB attempts already "used"), but on_tick/on_bar place no
             # orders and on_clock does nothing. Then warm-up ends and live trading resumes
             # with the correct intraday state.
-            bars = await self.data.bars(self.universe, "1Min", sess.open, utcnow())
+            # Finished minutes only: a half-built bar for the current minute would be
+            # counted now and then again when the complete one arrives.
+            bars = await self.data.bars(self.universe, "1Min", sess.open, completed_until(utcnow()))
             self.engine.warmup = True
             for b in sorted((b for v in bars.values() for b in v), key=lambda x: x.ts):
                 self.engine.on_tick(Tick(b.symbol, b.ts, b.c))
-                self.engine.on_bar(b)
+                self.deliver(b)
             self.engine.warmup = False
             self.journal.event(utcnow(), "INFO", "", "started mid-session; state rebuilt from today's bars")
 
-    async def trade(self, sess: Session) -> None:
-        """Stream market data into the engine until the close, ticking its clock each second.
+    def deliver(self, ev) -> None:
+        """Hand one event from the stream, the poller or the warm-up to the engine.
 
-        Two concurrent activities:
-          * `pump` (a background task) reads the websocket and calls on_tick / on_bar;
-          * the loop below wakes every second to: re-raise pump errors, check that data
-            is still arriving, and call engine.on_clock (flatten, loss limit, equity).
+        A minute bar the engine already has is dropped. Around a move between the stream
+        and polling both sources can send the same bar, and counting it twice would skew
+        VWAP and the volume average."""
+        if isinstance(ev, Tick):
+            self.engine.on_tick(ev)
+            return
+        if ev.ts <= self.last_bar.get(ev.symbol, EPOCH):
+            return
+        self.last_bar[ev.symbol] = ev.ts
+        self.engine.on_bar(ev)
+
+    def refresh_feeds(self) -> None:
+        """Re-split today's names between the websocket and polling, in place.
+
+        Called when trading starts and then every second. It is cheap, and it changes
+        nothing unless a name's need for real-time prices changed: typically a polled
+        name just became a position (it moves to the stream, and the least useful
+        streamed name moves to polling), or the ORB entry cutoff has passed. The first
+        split of the day and every move after it are written to the activity log."""
+        fc = self.cfg.feed
+        stream, poll = plan_feeds(self.engine, self.universe, self.cfg.benchmark,
+                                  fc.stream_limit, self.streamed)
+        added = [s for s in stream if s not in self.streamed]
+        removed = [s for s in self.streamed if s not in stream]
+        first = not self.streamed
+        self.streamed[:], self.polled[:] = stream, poll
+        self.info["feeds"] = {"stream": list(stream), "poll": list(poll), "poll_seconds": fc.poll_seconds}
+        if first:
+            self.journal.event(utcnow(), "FEED", "", f"{len(stream)} names streamed in real time"
+                               + (f", {len(poll)} polled every {fc.poll_seconds:g}s" if poll else ""))
+        elif added or removed:
+            moves = ([f"{', '.join(added)} now streamed in real time"] if added else []) + \
+                    ([f"{', '.join(removed)} now polled"] if removed else [])
+            self.journal.event(utcnow(), "FEED", "", "; ".join(moves))
+
+    async def trade(self, sess: Session) -> None:
+        """Feed market data into the engine until the close, ticking its clock each second.
+
+        Three concurrent activities:
+          * a `pump` task reads the websocket and calls on_tick / on_bar;
+          * a second `pump` task does the same for the REST poller (names that do not
+            fit on the websocket; idle when everything fits);
+          * the loop below wakes every second to: re-raise pump errors, move names
+            between the two sources (refresh_feeds), check that data is still
+            arriving, and call engine.on_clock (flatten, loss limit, equity).
         Why separate: on_clock must keep running even when no prices arrive (a quiet
         market or a dead connection); otherwise the end-of-day flatten could be missed."""
         last_msg = clock.monotonic()   # monotonic: unaffected by system clock changes
+        self.streamed.clear()
+        self.polled.clear()
+        self.refresh_feeds()
+        poller = Poller(self.data, self.polled, self.cfg.feed.poll_seconds)
 
-        async def pump() -> None:
+        async def pump(events, live: bool) -> None:
             nonlocal last_msg          # update the variable of the enclosing function
-            async for ev in self.data.stream(self.universe, sess.close):
-                last_msg = clock.monotonic()
-                if isinstance(ev, Tick):
-                    self.engine.on_tick(ev)
-                else:
-                    self.engine.on_bar(ev)
+            async for ev in events:
+                if live:
+                    last_msg = clock.monotonic()
+                self.deliver(ev)
 
-        task = asyncio.create_task(pump())
+        tasks = [asyncio.create_task(pump(self.data.stream(self.streamed, sess.close), True)),
+                 asyncio.create_task(pump(poller.run(sess.close), False))]
         try:
             while utcnow() < sess.close:
-                # If the stream task died (e.g. FatalFeedError), surface its exception here.
-                if task.done() and task.exception():
-                    raise task.exception()
-                # Stale-feed guard: trading on old prices is dangerous, so if nothing has
-                # arrived for stale_seconds the engine blocks new entries (stops still
-                # work on whatever prices do arrive). Logged only when the state changes.
-                ok = clock.monotonic() - last_msg < self.cfg.feed.stale_seconds
+                # If a source task died (e.g. FatalFeedError), surface its exception here.
+                for task in tasks:
+                    if task.done() and task.exception():
+                        raise task.exception()
+                self.refresh_feeds()
+                # Stale-feed guard: trading on old prices is dangerous, so if the stream
+                # has sent nothing, or polling has failed, for stale_seconds the engine
+                # blocks new entries (stops still work on whatever prices do arrive).
+                # Logged only when the state changes.
+                stale = self.cfg.feed.stale_seconds
+                stream_ok = clock.monotonic() - last_msg < stale
+                poll_ok = not self.polled or clock.monotonic() - poller.last_ok < stale
+                ok = stream_ok and poll_ok
                 if ok != self.engine.feed_ok:
                     self.engine.feed_ok = ok
+                    why = "data feed silent" if not stream_ok else "polling failing"
                     self.journal.event(utcnow(), "FEED", "", "data feed live" if ok
-                                       else "data feed silent; entries blocked")
+                                       else f"{why}; entries blocked")
                 self.engine.on_clock(utcnow())
                 await asyncio.sleep(1)
         finally:
-            # Always stop the stream task, and wait for it so it is not left dangling.
-            task.cancel()
-            await asyncio.gather(task, return_exceptions=True)
+            # Always stop both tasks, and wait for them so they are not left dangling.
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            self.info["feeds"] = None          # the dashboard stops showing live / polled
 
     async def after_close(self, sess: Session) -> None:
         """Close the books for the day, then ask the agent for a written review."""

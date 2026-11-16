@@ -13,13 +13,14 @@ No real orders are ever sent. Fills are simulated inside the app against live pr
             before the open                 9:30-16:00 New York                after the close
  daily bars ──► Agent (LLM) ──► DayPlan ──► Engine (rules + risk + paper broker) ──► Agent review
                                               ▲
-                          Alpaca websocket ───┘  ticks + 1-minute bars
+              Alpaca websocket + REST polling ┘  ticks + 1-minute bars
 ```
 
 | Layer | File | What it does |
 |---|---|---|
 | Schedule | `market_calendar.py` | NYSE sessions: weekends, holidays, half-days, daylight saving |
 | Data | `alpaca.py` | Daily/minute history over REST, live trades and bars over websocket, auto-reconnect |
+| Live feeds | `feeds.py` | Streams the names that need it most, polls the rest of the watchlist every 5 s |
 | Scanner | `scanner.py`, `finnhub.py` | Picks the daily watchlist from the 400 most liquid stocks |
 | Engine | `engine.py` | Strategies, position sizing, limits, stops/targets, simulated fills. Deterministic |
 | Agent | `agent.py` | Pre-market plan and post-close review. Can only *reduce* what the engine may do |
@@ -59,7 +60,8 @@ Each morning, about 25 minutes before the open, the app chooses that day's watch
    hype) and that no news is not a reason to reject. If the agent is off or fails, the
    top-ranked candidates are used.
 5. **Watchlist.** Symbols with open positions first, then approved candidates by rank, up
-   to 29 names plus SPY.
+   to 45 names plus SPY. The top 29 stream in real time and the rest are polled (see
+   below).
 
 Being on the watchlist triggers nothing. Entries still need the strategy rules below.
 Swing entries are also blocked within 3 sessions of an earnings report.
@@ -67,6 +69,41 @@ Swing entries are also blocked within 3 sessions of an earnings report.
 Every candidate is stored in the `scan` table with its metrics, headlines, decision and
 reason. Later runs fill in its next-day and 5-day move, and the dashboard shows the
 average for approved versus rejected names, so you can check whether the gate adds value.
+
+## Live data: streamed and polled names
+
+Alpaca's free websocket takes 30 symbols. To watch more, the app gets prices in two ways:
+
+| | Streamed (websocket) | Polled (REST) |
+|---|---|---|
+| Names | SPY plus up to `feed.stream_limit` (29) | the rest of the watchlist |
+| Trades | every trade, as it happens | the latest trade, every `feed.poll_seconds` (5 s) |
+| 1-minute bars | right after each minute | a few seconds after each minute |
+
+Both kinds of event go into the same engine calls, so the strategies and limits are the
+same for every name. Each poll is one request for all polled names (up to 200), plus a few
+bar requests a minute: about 16 requests a minute against the free plan's 200.
+
+Which names stream is decided again every second:
+
+1. **Open positions** always stream, because a stop needs every tick. When a polled name
+   is bought, it moves to the stream within a second.
+2. **Names that can still enter today** come next: an unused ORB attempt before the
+   entry cutoff (an hour before the close), or an untried swing trigger.
+3. **Everything else** (attempt used, nothing left to do) is polled.
+
+Within each group, names already streaming keep their place and the scan's rank decides
+the rest, so names do not flip back and forth. Every move is written to the activity log,
+the status bar shows how many names are live and polled, and the watchlist has a **Data**
+column (`live` or `every 5s`).
+
+The cost of polling is a few seconds of delay. An ORB entry on a polled name is decided
+a few seconds after the minute closes, and still fills at that bar's close. A swing entry
+sees the trigger crossed up to 5 s late. If polling keeps failing for `feed.stale_seconds`,
+entries are blocked, as they are when the stream goes silent.
+
+On the paid `sip` feed there is no symbol cap. Set `feed.stream_limit` to at least
+`scanner.max_watchlist` and nothing is polled.
 
 ## Charts
 
@@ -144,7 +181,7 @@ is today's most liquid stocks, which flatters the result (survivorship bias).
   written from the published protocols (`tests/fake_services.py`).
 - **Not run against the real services** from the build environment, which could not reach
   them. `python -m openbell doctor` is the real check: it tests your keys, the market clock,
-  the stock list, full-market history, pre-market bars, news, the 30-symbol stream limit,
+  the stock list, full-market history, pre-market bars, latest trades (polling), news, the 30-symbol stream limit,
   Finnhub and the agent model, and prints a report with no keys in it. The build environment could not reach them and had no keys.
   They follow the published protocols, but watch the first live session.
 - The simulation uses random-walk prices. It proves the plumbing; its P&L means nothing.
@@ -153,7 +190,10 @@ is today's most liquid stocks, which flatters the result (survivorship bias).
 
 - The free Alpaca stream carries **IEX trades only**, a small share of total volume.
   Prices are real-time but sparse in quiet names, and volume filters see IEX volume.
-  The paid `sip` feed fixes this (`feed.feed: sip`). The free stream allows 30 symbols.
+  The paid `sip` feed fixes this (`feed.feed: sip`). The free stream allows 30 symbols;
+  watchlist names past that are polled, with prices up to 5 s old.
+- Simulations and replays play every name from minute bars and do not model the polling
+  delay, so they are slightly kinder to polled names than a live session.
 - Fills are idealised: last trade price plus fixed slippage, no queue, no partial fills.
 - Long only, US equities only, no pre-market or after-hours trading.
 - The scan runs once, before the open. Its pre-market picture is 15 minutes old, and it

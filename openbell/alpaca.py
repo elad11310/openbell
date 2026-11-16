@@ -8,7 +8,9 @@ WHAT: `AlpacaData` provides:
         assets()     the list of every US-listed security (for the scanner universe)
         news_all()   recent headlines, grouped by ticker
         premarket()  today's pre-market price and dollar volume per symbol
-        stream()     an async generator of live Tick and Bar objects, reconnecting on drops
+        latest_trades()  each symbol's most recent trade, for names polled instead of streamed
+        stream()     an async generator of live Tick and Bar objects, reconnecting on drops;
+                     its symbol list can change while it runs (subscribe / unsubscribe)
       `FatalFeedError` signals problems that retrying cannot fix (bad keys, plan
       limits); `parse_ts` converts Alpaca's timestamps.
 HOW:  `httpx.AsyncClient` for REST and the `websockets` library for streaming, both
@@ -38,6 +40,7 @@ from .models import Bar, Tick
 log = logging.getLogger("openbell.alpaca")
 DATA_URL = "https://data.alpaca.markets/v2/stocks/bars"
 NEWS_URL = "https://data.alpaca.markets/v1beta1/news"
+LATEST_TRADES_URL = "https://data.alpaca.markets/v2/stocks/trades/latest"
 ASSETS_URL = "https://paper-api.alpaca.markets/v2/assets"
 STREAM_URL = "wss://stream.data.alpaca.markets/v2/{feed}"   # {feed} -> "iex" or "sip"
 # Trade conditions that do not represent a regular, in-sequence last sale
@@ -181,11 +184,39 @@ class AlpacaData:
             return None
         return out or None                   # an empty result also counts as "unavailable"
 
+    async def latest_trades(self, symbols: list) -> dict:
+        """symbol -> Tick of its most recent trade on the configured feed.
+
+        One request covers up to 200 symbols, which is what makes polling affordable: the
+        names that do not fit on the websocket cost one request per poll, all together.
+        A trade with a condition in SKIP_CONDITIONS is left out (the symbol is then
+        missing from the result), exactly as the stream drops it."""
+        out: dict = {}
+        async with httpx.AsyncClient(timeout=10, headers=self.headers) as c:
+            for i in range(0, len(symbols), 200):
+                r = await c.get(LATEST_TRADES_URL, params={"symbols": ",".join(symbols[i:i + 200]),
+                                                           "feed": self.feed})
+                if r.status_code in (401, 403):
+                    raise FatalFeedError(f"Alpaca rejected the request ({r.status_code}): {r.text[:200]}")
+                # Anything else, a 429 (rate limit) included, raises an ordinary error; the
+                # poller waits longer and tries again.
+                r.raise_for_status()
+                for sym, m in (r.json().get("trades") or {}).items():
+                    if SKIP_CONDITIONS.intersection(m.get("c") or []):
+                        continue
+                    out[sym] = Tick(sym, parse_ts(m["t"]), float(m["p"]), float(m.get("s", 0)))
+        return out
+
     async def stream(self, symbols: list, until: datetime) -> AsyncIterator:
         """Yield Tick and Bar objects until `until`. Reconnects with backoff.
 
         This is an async generator: callers write `async for ev in data.stream(...)` and
         each `yield` hands them one event while the connection stays open.
+
+        `symbols` is read again before every message, so the caller may change the list
+        while the stream runs. The difference is sent as "unsubscribe" / "subscribe"
+        actions on the open connection; the runner uses this to move names between the
+        stream and REST polling during the session (see feeds.py).
 
         Alpaca protocol, in order:
           1. connect; the server sends [{"T":"success","msg":"connected"}]
@@ -197,12 +228,17 @@ class AlpacaData:
         url = STREAM_URL.format(feed=self.feed)
         delay = 1.0                          # reconnect backoff, doubles up to 30 s
         while datetime.now(timezone.utc) < until:
+            # What this connection is subscribed to. A new connection starts with nothing.
+            subscribed: set = set()
+            authed = False
             try:
                 # ping_interval/ping_timeout: the library sends keep-alive pings and drops
                 # the connection if the server stops answering, so a dead link is noticed.
                 async with websockets.connect(url, ping_interval=20, ping_timeout=20) as ws:
                     await ws.send(json.dumps({"action": "auth", "key": self.key, "secret": self.secret}))
                     while datetime.now(timezone.utc) < until:
+                        if authed:
+                            await self._resubscribe(ws, symbols, subscribed)
                         try:
                             # Wait at most 5 s so the `until` check above runs regularly
                             # even when no messages arrive (quiet market).
@@ -231,8 +267,8 @@ class AlpacaData:
                                     raise ConnectionError(m.get("msg"))
                             elif kind == "success" and m.get("msg") == "authenticated":
                                 delay = 1.0          # a good connection resets the backoff
-                                await ws.send(json.dumps({"action": "subscribe",
-                                                          "trades": symbols, "bars": symbols}))
+                                authed = True
+                                await self._resubscribe(ws, symbols, subscribed)
                                 log.info("stream authenticated (%s feed)", self.feed)
             except FatalFeedError:
                 raise
@@ -242,3 +278,21 @@ class AlpacaData:
                 log.warning("stream disconnected (%s); reconnecting in %.0fs", e, delay)
                 await asyncio.sleep(delay)
                 delay = min(delay * 2, 30)
+
+    @staticmethod
+    async def _resubscribe(ws, symbols: list, subscribed: set) -> None:
+        """Bring the connection's subscription in line with `symbols`, updating
+        `subscribed` in place. Unsubscribes first, so the plan's symbol cap is never
+        exceeded for a moment while names are swapped. Sends nothing if nothing changed."""
+        want = set(symbols)
+        # `new` keeps the caller's order (benchmark and positions first); dict.fromkeys
+        # drops duplicates.
+        gone, new = sorted(subscribed - want), [s for s in dict.fromkeys(symbols) if s not in subscribed]
+        if gone:
+            await ws.send(json.dumps({"action": "unsubscribe", "trades": gone, "bars": gone}))
+        if new:
+            await ws.send(json.dumps({"action": "subscribe", "trades": new, "bars": new}))
+        if subscribed and (gone or new):
+            log.info("stream symbols changed: +%s -%s", new, gone)
+        subscribed.clear()
+        subscribed.update(want)

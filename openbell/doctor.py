@@ -6,7 +6,8 @@ Nothing here places orders or changes anything on any account.
 WHAT: Runs a list of live checks and prints one PASS / WARN / FAIL / SKIP line each:
         Alpaca    keys + market clock (and whether our calendar agrees), asset list,
                   full-market daily history, which data plan the key is on, pre-market
-                  bars, regular-session minute bars, news, the websocket (30-symbol
+                  bars, regular-session minute bars, latest trades (how names past the
+                  stream limit are polled), news, the websocket (30-symbol
                   subscription, the 31st refused) and Alpaca's always-on test stream;
         Finnhub   earnings calendar and company metrics (if a key is set);
         Anthropic one real `select` call through the app's own prompt and parser.
@@ -162,7 +163,17 @@ async def check_alpaca(cfg: Config, rep: Report) -> None:
         else:
             rep.add("FAIL", "alpaca.minute_" + cfg.feed.feed, _err(r))
 
-        # 7. news
+        # 7. latest trades through the app's client: how watchlist names that do not fit
+        # on the websocket are priced during the session (feeds.Poller)
+        try:
+            got = await data.latest_trades(["SPY", "NVDA", "AAPL"])
+            age = {s: f"{(now - t.ts).total_seconds() / 60:.0f} min ago" for s, t in got.items()}
+            rep.add("PASS" if got else "WARN", "alpaca.latest_trades",
+                    f"{len(got)} of 3 symbols on the {cfg.feed.feed} feed; last trade {age}")
+        except Exception as e:
+            rep.add("FAIL", "alpaca.latest_trades", f"{type(e).__name__}: {e}")
+
+        # 8. news
         r = await c.get(NEWS_URL, params={"limit": 50, "sort": "desc", "start": _iso(now - timedelta(hours=48)),
                                           "end": _iso(now)})
         if r.status_code == 200:

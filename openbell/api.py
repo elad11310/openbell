@@ -82,6 +82,9 @@ def create_app(engine: Engine, journal: Journal, cfg: Config, info: dict,
             "starting_equity": cfg.starting_equity,
             "next_session": info.get("next_session"),
             "agent_active": info.get("agent_active", False),
+            # Live run, while trading: which names stream in real time and which are
+            # polled (see feeds.py). None otherwise; the page then hides the column.
+            "feeds": info.get("feeds"),
             "stats": journal.stats(),
             "trades": journal.trades(limit=25),
             "events": journal.rows("SELECT ts, kind, symbol, message FROM events "

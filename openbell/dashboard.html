@@ -51,6 +51,7 @@
   td.num, th.num { text-align: right; padding-right: 0; padding-left: 10px; }
   td.wrap, th.wrap { white-space: normal; min-width: 220px; padding-left: 16px; }
   td.wrap { color: var(--text-2); }
+  td.lead, th.lead { padding-left: 16px; }   /* a left-aligned column right after a number column */
   .empty { color: var(--muted); padding: 6px 0; }
   .tag { font-size: 11px; font-weight: 600; padding: 1px 6px; border-radius: 4px; border: 1px solid var(--border); color: var(--text-2); }
   #chart { position: relative; }
@@ -200,11 +201,14 @@ function render(s) {
   if (open) when = `closes in ${countdown(new Date(sess.close) - now)}${sess.early_close ? " (half day)" : ""}`;
   else if (nx && new Date(nx.open) > now) when = `opens in ${countdown(new Date(nx.open) - now)}${nx.early_close ? " (half day)" : ""}`;
   const dot = open ? (s.feed_ok && !s.halted ? "on" : "warn") : "";
+  // While trading live: which names stream in real time and which are polled (feeds.py).
+  const fd = s.feeds;
   $("status").innerHTML =
     `<span class="pill"><span class="dot ${dot}"></span>${open ? "Market open" : "Market closed"}</span>` +
     `<span>${esc(s.status)}${when ? " · " + when : ""}</span>` +
     `<span>${clock(s.now, "America/New_York")} New York · ${clock(s.now, TZ)} local</span>` +
-    `<span>Agent ${s.agent_active ? "on" : "off"}</span>`;
+    `<span>Agent ${s.agent_active ? "on" : "off"}</span>` +
+    (fd ? `<span>Data ${fd.stream.length} live · ${fd.poll.length} polled</span>` : "");
   const b = $("banner"), msgs = [];
   if (s.halted) msgs.push("Daily loss limit reached. No new entries today.");
   if (open && !s.feed_ok) msgs.push("Data feed is silent. Entries are blocked until it recovers.");
@@ -232,6 +236,9 @@ function render(s) {
     {h: "Symbol", f: r => sym(r.symbol)}, {h: "Last", cls: "num", f: r => money(r.last)},
     {h: "Day", cls: "num", f: r => signed(r.chg_pct, 2, "%")}, {h: "VWAP", cls: "num", f: r => money(r.vwap)},
     {h: "Range high", cls: "num", f: r => money(r.or_high)}, {h: "Swing trigger", cls: "num", f: r => money(r.swing_trigger)},
+    // "live" = websocket, every trade; otherwise polled over REST, up to poll_seconds old.
+    ...(fd ? [{h: "Data", cls: "lead", f: r => fd.stream.includes(r.symbol) ? `<span class="tag">live</span>` :
+      `<span class="tag" title="Not on the real-time stream: prices are fetched every ${fd.poll_seconds} s">every ${fd.poll_seconds}s</span>`}] : []),
     {h: "Agent note", cls: "wrap", f: r => esc(r.note)},
   ], s.watchlist, "No symbols.");
 

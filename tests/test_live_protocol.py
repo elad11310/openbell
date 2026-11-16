@@ -50,6 +50,8 @@ def wired(host, monkeypatch):
     for k, v in urls.items():
         monkeypatch.setattr(alpaca, k, v)
         monkeypatch.setattr(doctor, k, v)
+    # Used only through AlpacaData (doctor included), so only alpaca.py holds it.
+    monkeypatch.setattr(alpaca, "LATEST_TRADES_URL", f"http://{host}/v2/stocks/trades/latest")
     monkeypatch.setattr(doctor, "CLOCK_URL", f"http://{host}/v2/clock")
     monkeypatch.setattr(doctor, "TEST_STREAM", f"ws://{host}/v2/test")
     monkeypatch.setattr(doctor, "FINNHUB", f"http://{host}/api/v1")
@@ -103,6 +105,32 @@ def test_stream_yields_ticks_and_bars_and_stops(wired):
     assert [type(e) for e in got].count(Bar) == 1
 
 
+def test_latest_trades_parse_and_skip_conditions(wired):
+    got = asyncio.run(wired.latest_trades(["NVDA", "ODD", "AMD"]))
+    assert set(got) == {"NVDA", "AMD"}                        # "ODD" carries condition W: dropped
+    assert isinstance(got["NVDA"], Tick) and got["NVDA"].price == 104.0
+    assert got["NVDA"].ts.tzinfo is not None and got["NVDA"].ts < datetime.now(UTC)
+
+
+def test_stream_follows_symbol_list_changes(wired):
+    """The runner moves names between the stream and polling by editing the list it
+    passed in; the open connection must unsubscribe and subscribe accordingly."""
+    fake_services.app.state.ws_actions = []
+
+    async def go():
+        syms, got = ["NVDA", "AMD"], []
+        async for ev in wired.stream(syms, datetime.now(UTC) + timedelta(seconds=3)):
+            got.append(ev)
+            if len(got) == 1:
+                syms[:] = ["NVDA", "MU"]                      # swap AMD for MU mid-stream
+        return got
+    got = asyncio.run(go())
+    assert fake_services.app.state.ws_actions == [
+        ("subscribe", ["NVDA", "AMD"]), ("unsubscribe", ["AMD"]), ("subscribe", ["MU"])]
+    # The fake sends prices for the first symbol of each subscribe: NVDA, then MU.
+    assert [e.symbol for e in got if isinstance(e, Tick)] == ["NVDA", "MU"]
+
+
 def test_stream_bad_key_is_fatal(wired):
     bad = AlpacaData("wrong", "secret")
 
@@ -125,7 +153,8 @@ def test_doctor_full_run(wired, monkeypatch, capsys):
     out = capsys.readouterr().out                 # everything doctor printed
     assert code == 0, out
     for name in ("alpaca.clock", "alpaca.assets", "alpaca.daily_sip", "alpaca.parse_bars", "alpaca.plan",
-                 "alpaca.premarket", "alpaca.minute_iex", "alpaca.news", "alpaca.parse_news",
+                 "alpaca.premarket", "alpaca.minute_iex", "alpaca.latest_trades", "alpaca.news",
+                 "alpaca.parse_news",
                  "alpaca.stream_30", "alpaca.stream_31", "alpaca.stream_test", "finnhub.earnings",
                  "finnhub.metric"):
         assert f"[PASS] {name}" in out, (name, out)

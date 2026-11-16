@@ -36,8 +36,8 @@ class RiskCfg:
     risk_per_trade_pct: float = 0.5      # % of equity lost if the stop is hit
     max_position_pct: float = 20.0       # % of equity in one name
     max_gross_exposure_pct: float = 100.0  # total market value of positions / equity (100 = no leverage)
-    max_positions: int = 6
-    max_trades_per_day: int = 8
+    max_positions: int = 15 #6
+    max_trades_per_day: int = 8 #8
     daily_loss_limit_pct: float = 2.0    # halt new entries + flatten intraday
     slippage_bps: float = 2.0            # 1 bp = 0.01%; added to buys, taken off sells
 
@@ -83,9 +83,12 @@ class AgentCfg:
 
 @dataclass
 class FeedCfg:
-    """Live market-data stream settings."""
+    """Live market-data settings. The first `stream_limit` names (plus the benchmark) get
+    the real-time websocket; the rest of the watchlist is polled over REST (feeds.py)."""
     feed: str = "iex"                    # "iex" (free) or "sip" (paid)
-    stale_seconds: int = 45              # block entries if the stream is silent
+    stream_limit: int = 29               # websocket names besides the benchmark (free IEX: 30 in all)
+    poll_seconds: float = 5.0            # how often polled names' latest trades are fetched
+    stale_seconds: int = 45              # block entries if the stream (or polling) goes silent
     premarket_lead_minutes: int = 25     # how long before the open to wake up and scan
 
 
@@ -101,7 +104,7 @@ class ScannerCfg:
     min_gap_pct: float = 1.0             # intraday: pre-market gap up that counts as 'in play'
     min_premarket_share: float = 0.005   # ... with pre-market dollar volume >= this share of a normal day
     candidates: int = 45                 # shortlist shown to the agent
-    max_watchlist: int = 29              # live names per day (free stream: 30 incl. benchmark)
+    max_watchlist: int = 45              # names watched per day; beyond feed.stream_limit they are polled
     news_lookback_hours: int = 48
     earnings_blackout_days: int = 3      # no new swing entry this many sessions before a report
 
@@ -161,8 +164,14 @@ class Config:
         self.symbols = [s.upper() for s in self.symbols]
         self.symbols = list(dict.fromkeys(self.symbols))
         # The free IEX websocket accepts at most 30 symbols; one slot is the benchmark.
-        if self.feed.feed == "iex" and self.scanner.max_watchlist > 29:
-            raise ValueError("config: the free IEX stream allows 30 symbols (29 + benchmark)")
+        # Watchlist names beyond the stream are polled, so max_watchlist is not capped here.
+        if self.feed.feed == "iex" and self.feed.stream_limit > 29:
+            raise ValueError("config: the free IEX stream allows 30 symbols (stream_limit 29 + benchmark)")
+        if self.feed.stream_limit < 1 or self.scanner.max_watchlist < 1:
+            raise ValueError("config: feed.stream_limit and scanner.max_watchlist must be at least 1")
+        # One poll is one request; Alpaca's free plan allows about 200 a minute in total.
+        if self.feed.poll_seconds < 1:
+            raise ValueError("config: feed.poll_seconds must be at least 1")
         if len(self.symbols) > self.scanner.max_watchlist:
             raise ValueError("config: symbols is longer than scanner.max_watchlist")
         # Above 2% per trade, a few losses in a row would do serious damage.
