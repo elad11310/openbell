@@ -10,12 +10,17 @@
     --page: #f4f3ef; --surface: #fcfcfb; --text: #0b0b0b; --text-2: #52514e; --muted: #898781;
     --grid: #e1e0d9; --border: rgba(11,11,11,0.10); --series: #2a78d6;
     --good: #0ca30c; --critical: #d03b3b; --warning: #fab219;
+    /* Price-chart lines, in the palette's fixed order blue, orange, aqua (checked for
+       colour-blind separation in both themes). VWAP is also dashed, so it never relies
+       on colour alone next to the green candles. */
+    --ema-fast: #2a78d6; --ema-slow: #eb6834; --vwap: #1baf7a;
   }
   @media (prefers-color-scheme: dark) {
     :root {
       color-scheme: dark;
       --page: #111110; --surface: #1a1a19; --text: #f0efec; --text-2: #c3c2b7; --muted: #898781;
       --grid: #2c2c2a; --border: rgba(255,255,255,0.10); --series: #3987e5;
+      --ema-fast: #3987e5; --ema-slow: #d95926; --vwap: #199e70;
     }
   }
   * { box-sizing: border-box; }
@@ -59,7 +64,36 @@
   .plan p, .review p { margin: 0 0 6px; color: var(--text-2); white-space: pre-wrap; }
   .banner { border-left: 3px solid var(--warning); }
   footer { color: var(--muted); font-size: 12px; text-align: center; padding: 4px 0 16px; }
+  /* A ticker that opens its chart: looks like bold text with a dotted underline. */
+  button.sym { background: none; border: 0; padding: 0; font: inherit; font-weight: 700; color: inherit; cursor: pointer;
+               text-decoration: underline dotted var(--muted); text-underline-offset: 3px; }
+  button.sym:hover, button.sym:focus-visible { color: var(--series); text-decoration-color: currentColor; }
+  /* Chart dialog: <dialog> gives the dark backdrop, focus trapping and Esc-to-close for free. */
+  #chartDlg { width: min(1100px, calc(100vw - 32px)); max-width: none; max-height: calc(100vh - 32px); padding: 14px;
+              background: var(--surface); color: var(--text); border: 1px solid var(--border); border-radius: 10px; }
+  #chartDlg::backdrop { background: rgba(0,0,0,0.45); }
+  .dlg-head { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; margin-bottom: 8px; }
+  .dlg-head h2 { font-size: 18px; color: var(--text); margin: 0; }
+  .dlg-head .chg { font-size: 13px; font-variant-numeric: tabular-nums; color: var(--text-2); }
+  .ranges { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+  .ranges button { background: none; border: 0; padding: 4px 10px; font: inherit; font-size: 12px; color: var(--text-2); cursor: pointer; }
+  .ranges button[aria-pressed="true"] { background: var(--grid); color: var(--text); font-weight: 600; }
+  .dlg-head form { margin-left: auto; display: flex; gap: 6px; }
+  .dlg-head input { width: 90px; font: inherit; font-size: 12px; padding: 3px 6px; border: 1px solid var(--border); border-radius: 6px;
+                    background: var(--page); color: var(--text); text-transform: uppercase; }
+  .dlg-head .x { background: none; border: 0; font-size: 16px; color: var(--text-2); cursor: pointer; padding: 2px 6px; }
+  .legend { display: flex; flex-wrap: wrap; gap: 4px 14px; font-size: 12px; color: var(--text-2); font-variant-numeric: tabular-nums; min-height: 18px; }
+  .legend b { color: var(--text); font-weight: 600; }
+  .legend .sw { display: inline-block; width: 14px; height: 0; border-top: 2px solid; vertical-align: middle; margin-right: 4px; }
+  #pchart { position: relative; height: min(60vh, 520px); margin-top: 6px; }
+  #chartMsg { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; text-align: center;
+              color: var(--muted); font-size: 13px; pointer-events: none; z-index: 3; }
+  #chartNote { margin: 8px 0 0; }
 </style>
+<!-- TradingView's open-source charting library (Apache-2.0), pinned to an exact version.
+     Loaded from a CDN, so charts need internet access (the app needs it anyway). If it
+     fails to load, the rest of the dashboard still works and the chart says why. -->
+<script src="https://unpkg.com/lightweight-charts@4.2.0/dist/lightweight-charts.standalone.production.js"></script>
 </head>
 <body>
 <main>
@@ -83,8 +117,19 @@
   <section class="card"><h2>Recent trades</h2><div class="scroll" id="trades"></div></section>
   <section class="card"><h2>Activity</h2><div class="scroll" id="events"></div></section>
   <section class="card review" id="reviewCard" hidden><h2 id="reviewTitle">Review</h2><div id="review"></div></section>
-  <footer>Simulated fills on live prices. No real orders are sent.</footer>
+  <footer>Simulated fills on live prices. No real orders are sent.<span id="chartHint" hidden> Click any ticker to open its chart.</span></footer>
 </main>
+<dialog id="chartDlg" aria-labelledby="chartSym">
+  <div class="dlg-head">
+    <div><h2 id="chartSym"></h2><div class="chg" id="chartChg"></div></div>
+    <div class="ranges" id="ranges" role="group" aria-label="Chart range"></div>
+    <form id="chartGo"><input id="chartInput" placeholder="Symbol" aria-label="Open another symbol" autocomplete="off"></form>
+    <button class="x" id="chartClose" aria-label="Close chart">✕</button>
+  </div>
+  <div class="legend" id="chartLegend"></div>
+  <div id="pchart"><div id="chartMsg"></div></div>
+  <div class="sub" id="chartNote"></div>
+</dialog>
 <script>
 const $ = id => document.getElementById(id);
 const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
@@ -146,6 +191,9 @@ function drawChart() {
 
 function render(s) {
   TZ = s.display_tz || "UTC";
+  // Charts exist only when the server was given a chart data source (live run, sim --serve).
+  LAST = s; RANGES = s.chart_ranges || []; CHARTS = RANGES.length > 0;
+  $("chartHint").hidden = !CHARTS;
   const now = new Date(s.now), sess = s.session, nx = s.next_session;
   const open = sess && now >= new Date(sess.open) && now < new Date(sess.close);
   let when = "";
@@ -173,7 +221,7 @@ function render(s) {
   $("tiles").innerHTML = tiles.map(t => `<div class="card tile"><div class="label">${t[0]}</div><div class="value">${t[1]}</div><div class="sub">${t[2]}</div></div>`).join("");
 
   table($("positions"), [
-    {h: "Symbol", f: r => `<b>${esc(r.symbol)}</b> <span class="tag">${esc(r.strategy)}</span>`},
+    {h: "Symbol", f: r => `${sym(r.symbol)} <span class="tag">${esc(r.strategy)}</span>`},
     {h: "Qty", cls: "num", f: r => r.qty}, {h: "Entry", cls: "num", f: r => money(r.entry)},
     {h: "Last", cls: "num", f: r => money(r.last)}, {h: "Stop", cls: "num", f: r => money(r.stop)},
     {h: "Target", cls: "num", f: r => r.target ? money(r.target) : "trail"},
@@ -181,7 +229,7 @@ function render(s) {
   ], s.positions, "No open positions.");
 
   table($("watch"), [
-    {h: "Symbol", f: r => `<b>${esc(r.symbol)}</b>`}, {h: "Last", cls: "num", f: r => money(r.last)},
+    {h: "Symbol", f: r => sym(r.symbol)}, {h: "Last", cls: "num", f: r => money(r.last)},
     {h: "Day", cls: "num", f: r => signed(r.chg_pct, 2, "%")}, {h: "VWAP", cls: "num", f: r => money(r.vwap)},
     {h: "Range high", cls: "num", f: r => money(r.or_high)}, {h: "Swing trigger", cls: "num", f: r => money(r.swing_trigger)},
     {h: "Agent note", cls: "wrap", f: r => esc(r.note)},
@@ -196,7 +244,7 @@ function render(s) {
   const verdict = r => r.decision === "reject" ? `<span class="verdict no"><i>✕</i>Rejected</span>` :
     r.picked ? `<span class="verdict ok"><i>✓</i>Watching</span>` : `<span class="verdict skip"><i>–</i>No slot</span>`;
   table($("scan"), [
-    {h: "#", f: r => r.rank}, {h: "Symbol", f: r => `<b>${esc(r.symbol)}</b> <span class="tag">${esc(r.kind)}</span>`},
+    {h: "#", f: r => r.rank}, {h: "Symbol", f: r => `${sym(r.symbol)} <span class="tag">${esc(r.kind)}</span>`},
     {h: "Result", f: verdict}, {h: "Gap", cls: "num", f: r => signed(r.metrics.gap_pct, 2, "%")},
     {h: "News", f: r => r.metrics.fresh_news ? "new" : "–"},
     {h: "Rel. volume", cls: "num", f: r => money(r.metrics.rvol) + "×"},
@@ -217,7 +265,7 @@ function render(s) {
   ], Object.entries(s.stats || {}).filter(e => e[1].trades), "No closed trades yet.");
 
   table($("trades"), [
-    {h: "Exit (ET)", f: r => stamp(r.exit_ts)}, {h: "Symbol", f: r => `<b>${esc(r.symbol)}</b> <span class="tag">${esc(r.strategy)}</span>`},
+    {h: "Exit (ET)", f: r => stamp(r.exit_ts)}, {h: "Symbol", f: r => `${sym(r.symbol)} <span class="tag">${esc(r.strategy)}</span>`},
     {h: "Qty", cls: "num", f: r => r.qty}, {h: "Entry", cls: "num", f: r => money(r.entry_px)},
     {h: "Exit", cls: "num", f: r => money(r.exit_px)}, {h: "P&L", cls: "num", f: r => signed(r.pnl)},
     {h: "R", cls: "num", f: r => signed(r.r_multiple)}, {h: "Reason", f: r => esc(r.exit_reason)},
@@ -225,7 +273,7 @@ function render(s) {
 
   table($("events"), [
     {h: "Time (ET)", f: r => stamp(r.ts)}, {h: "", f: r => `<span class="tag">${esc(r.kind)}</span>`},
-    {h: "Symbol", f: r => esc(r.symbol)}, {h: "Detail", cls: "wrap", f: r => esc(r.message)},
+    {h: "Symbol", f: r => sym(r.symbol)}, {h: "Detail", cls: "wrap", f: r => esc(r.message)},
   ], s.events || [], "Nothing yet.");
 
   $("reviewCard").hidden = !s.review;
@@ -234,8 +282,201 @@ function render(s) {
   if (sig !== curveSig) { curveSig = sig; curve = next; drawChart(); }
 }
 
+// ---------------------------------------------------------------- price charts
+// Clicking a ticker anywhere on the page opens a dialog with its chart: candles, volume,
+// EMA 20/50, VWAP (intraday ranges), arrows for this app's paper entries and exits, and
+// dotted lines for the open position's entry/stop/target, the swing trigger and today's
+// opening range. Data comes from /api/chart (built by charts.py); drawing is done by
+// TradingView's Lightweight Charts library, loaded in <head>.
+let CHARTS = false, RANGES = [], LAST = null;     // filled in by render() from /api/state
+// A ticker cell: a button that opens the chart, or plain bold text when charts are off.
+const sym = s => !s ? "" : CHARTS ? `<button class="sym" data-sym="${esc(s)}" title="Open chart">${esc(s)}</button>` : `<b>${esc(s)}</b>`;
+const compact = n => n == null ? "–" : n.toLocaleString("en-US", {notation: "compact", maximumFractionDigits: 1});
+const css = name => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
+// Chart state: which symbol/range is shown, a request counter (to drop late replies),
+// the library objects (`view`), the last payload (`data`) and the refresh timer.
+const ch = {sym: null, range: "1D", req: 0, view: null, data: null, timer: null};
+
+// Create the chart and its series. Colours are read from the CSS tokens at build time,
+// so the chart matches the light or dark theme (it is rebuilt when the theme changes).
+function buildView(d) {
+  const LC = window.LightweightCharts, up = css("--good"), down = css("--critical");
+  const chart = LC.createChart($("pchart"), {
+    autoSize: true,                                // follows the container's size
+    layout: {background: {type: "solid", color: css("--surface")}, textColor: css("--muted"), fontSize: 11,
+             fontFamily: 'system-ui, -apple-system, "Segoe UI", sans-serif'},
+    grid: {vertLines: {color: css("--grid")}, horzLines: {color: css("--grid")}},
+    rightPriceScale: {borderVisible: false}, crosshair: {mode: LC.CrosshairMode.Normal},
+    // Clock times only on intraday ranges; daily candles show dates.
+    timeScale: {borderVisible: false, timeVisible: d.intraday, secondsVisible: false},
+  });
+  const candles = chart.addCandlestickSeries({upColor: up, downColor: down, wickUpColor: up, wickDownColor: down, borderVisible: false,
+    // Price lines (stop, target, ...) do not normally widen the price axis, so a stop just
+    // below today's range would be invisible. Stretch the axis to include each level,
+    // unless that would more than double the height (it would squash the candles);
+    // such far-off levels stay off-screen until the user drags the price axis.
+    autoscaleInfoProvider: original => {
+      const r = original();
+      if (!r || !r.priceRange || !ch.data) return r;
+      let {minValue: lo, maxValue: hi} = r.priceRange;
+      const span = hi - lo;
+      for (const l of ch.data.levels) {
+        if (l.price < lo && lo - l.price <= span) lo = l.price;
+        if (l.price > hi && l.price - hi <= span) hi = l.price;
+      }
+      return {...r, priceRange: {minValue: lo, maxValue: hi}};
+    }});
+  // Price uses the top ~70% of the height; volume sits in the bottom 20% on its own
+  // hidden scale ("vol"), the usual stock-chart layout. The two never share an axis.
+  candles.priceScale().applyOptions({scaleMargins: {top: 0.06, bottom: 0.3}});
+  const volume = chart.addHistogramSeries({priceScaleId: "vol", priceFormat: {type: "volume"}, lastValueVisible: false, priceLineVisible: false});
+  chart.priceScale("vol").applyOptions({scaleMargins: {top: 0.8, bottom: 0}});
+  // Indicator lines: no price label, no dot under the crosshair; the legend shows their values.
+  const quiet = {lastValueVisible: false, priceLineVisible: false, crosshairMarkerVisible: false};
+  const line = (color, dashed) => chart.addLineSeries({...quiet, color, lineWidth: 2,
+    lineStyle: dashed ? LC.LineStyle.Dashed : LC.LineStyle.Solid});
+  // VWAP lines (one per session) are created in drawView, which knows how many there are.
+  const view = {key: d.symbol + d.range, chart, candles, volume, up, down, lines: [], vwaps: [],
+    volMa: chart.addLineSeries({...quiet, priceScaleId: "vol", color: css("--muted"), lineWidth: 1}),
+    emaF: line(css("--ema-fast")), emaS: line(css("--ema-slow")), addVwap: () => line(css("--vwap"), true)};
+  // The legend follows the crosshair; off the chart it shows the latest candle.
+  chart.subscribeCrosshairMove(p => showLegend(p.time ? p.seriesData : null));
+  return view;
+}
+
+function dropView() { if (ch.view) { ch.view.chart.remove(); ch.view = null; } }
+
+// Put a payload on screen. A new symbol or range builds a fresh chart and fits it to
+// the data; a periodic refresh of the same one updates in place, keeping the user's zoom.
+function drawView(d) {
+  const fresh = !ch.view || ch.view.key !== d.symbol + d.range;
+  if (fresh) { dropView(); ch.view = buildView(d); }
+  ch.data = d;
+  const v = ch.view, LC = window.LightweightCharts;
+  v.candles.setData(d.candles.map(c => ({time: c.time, open: c.open, high: c.high, low: c.low, close: c.close})));
+  // Volume bars take the candle's direction colour at 35% opacity ("59" hex alpha).
+  v.volume.setData(d.candles.map(c => ({time: c.time, value: c.volume, color: (c.close >= c.open ? v.up : v.down) + "59"})));
+  v.volMa.setData(d.volume_ma); v.emaF.setData(d.ema_fast); v.emaS.setData(d.ema_slow);
+  // VWAP restarts every session, so each session is its own line; a single series would
+  // join one day's last value to the next day's first.
+  v.vwaps.forEach(s => v.chart.removeSeries(s));
+  v.vwaps = d.vwap.map(pts => { const s = v.addVwap(); s.setData(pts); return s; });
+  // Entries: up arrow under the candle; exits: down arrow above it, labelled with the R result.
+  v.candles.setMarkers(d.markers.map(m => m.side === "buy"
+    ? {time: m.time, position: "belowBar", shape: "arrowUp", color: v.up, text: m.text}
+    : {time: m.time, position: "aboveBar", shape: "arrowDown", color: v.down, text: m.text}));
+  // Price levels are replaced on every draw because stops move and positions close.
+  v.lines.forEach(l => v.candles.removePriceLine(l));
+  const tone = {entry: css("--text-2"), stop: v.down, target: v.up, trigger: css("--series"), range: css("--muted")};
+  v.lines = d.levels.map(l => v.candles.createPriceLine({price: l.price, color: tone[l.kind], lineWidth: 1,
+    lineStyle: LC.LineStyle.Dotted, axisLabelVisible: true, title: l.label}));
+  if (fresh) v.chart.timeScale().fitContent();
+
+  // Header: last price and the change over the range (vs the close before it).
+  const n = d.candles.length, last = n ? d.candles[n - 1].close : null;
+  $("chartChg").innerHTML = last == null || d.base == null ? "" :
+    `<b>${money(last)}</b> ${signed(last - d.base)} (${signed((last / d.base - 1) * 100, 2, "%")}) · ${esc(d.range)}`;
+  $("chartMsg").textContent = n ? "" : "No bars for this symbol in this range.";
+  showLegend(null);
+
+  // Footnote: where the data comes from, plus what the scan said about this symbol.
+  const src = d.feed === "synthetic" ? "Simulated prices" : d.feed === "sip" ? "Full-market (SIP) prices" :
+    `${String(d.feed).toUpperCase()} prices (one exchange only, so volume is partial)`;
+  const bars = d.intraday ? `${d.bar_minutes}-minute candles, New York time` : "daily candles";
+  const scan = ((LAST && LAST.scan) || []).find(r => r.symbol === d.symbol);
+  $("chartNote").textContent = `${src}${d.delay_minutes ? `, ${d.delay_minutes} min delayed` : ""} · ${bars}. ` +
+    "Arrows: paper entries and exits. Dotted lines: position and setup levels." +
+    (scan ? ` Scan ${scan.day}: #${scan.rank} ${scan.kind}, ${scan.decision === "reject" ? "rejected" : scan.picked ? "watching" : "no slot"}` +
+            (scan.reason ? ` (${scan.reason})` : "") + "." : "");
+}
+
+// Legend line: OHLC + volume + indicator values at the crosshair (`sd` = the library's
+// map of series -> value at that time), or for the latest candle when `sd` is null.
+function showLegend(sd) {
+  const d = ch.data, v = ch.view, n = d ? d.candles.length : 0;
+  if (!n || !v) { $("chartLegend").innerHTML = ""; return; }
+  const c = sd ? sd.get(v.candles) : d.candles[n - 1];
+  if (!c) return;                                  // crosshair over empty space
+  const at = (series, pts) => sd ? (sd.get(series) || {}).value : (pts.length ? pts[pts.length - 1].value : null);
+  const vol = sd ? (sd.get(v.volume) || {}).value : d.candles[n - 1].volume;
+  // VWAP: under the crosshair, whichever session's line has a point there; otherwise
+  // the last point of the latest session.
+  const lastDay = d.vwap.length ? d.vwap[d.vwap.length - 1] : [];
+  const vwap = sd ? v.vwaps.map(s => (sd.get(s) || {}).value).find(x => x != null)
+                  : (lastDay.length ? lastDay[lastDay.length - 1].value : null);
+  // Each indicator gets a line swatch AND its name, so identity never rests on colour.
+  const item = (color, name, val, dashed) => val == null ? "" :
+    `<span><span class="sw" style="border-color:${color}${dashed ? ";border-top-style:dashed" : ""}"></span>${name} <b>${money(val)}</b></span>`;
+  $("chartLegend").innerHTML =
+    `<span>O <b>${money(c.open)}</b> H <b>${money(c.high)}</b> L <b>${money(c.low)}</b> C <b>${money(c.close)}</b></span>` +
+    `<span>Vol <b>${compact(vol)}</b></span>` +
+    item(css("--ema-fast"), `EMA ${d.ema_periods[0]}`, at(v.emaF, d.ema_fast)) +
+    item(css("--ema-slow"), `EMA ${d.ema_periods[1]}`, at(v.emaS, d.ema_slow)) +
+    (d.intraday ? item(css("--vwap"), "VWAP", vwap, true) : "");
+}
+
+// Fetch and draw the current symbol/range. `my` numbers the request: if the user has
+// switched symbol or range while it was in flight, the late reply is ignored.
+async function loadChart() {
+  const my = ++ch.req;
+  if (!ch.view) $("chartMsg").textContent = "Loading…";
+  try {
+    const res = await fetch(`api/chart/${encodeURIComponent(ch.sym)}?range=${ch.range}`);
+    const body = await res.json();
+    if (my !== ch.req) return;
+    if (!res.ok) throw new Error(body.detail || res.statusText);
+    if (!window.LightweightCharts) throw new Error("The chart library did not load. Charts need internet access.");
+    drawView(body);
+  } catch (e) {
+    if (my !== ch.req) return;
+    // A failed refresh keeps the chart already on screen; a failed first load explains itself.
+    if (ch.view) $("chartNote").textContent = `Refresh failed: ${e.message}`;
+    else { $("chartMsg").textContent = e.message; $("chartLegend").innerHTML = ""; }
+  }
+}
+
+function renderRanges() {
+  $("ranges").innerHTML = RANGES.map(r => `<button type="button" data-range="${r}" aria-pressed="${r === ch.range}">${r}</button>`).join("");
+}
+
+function openChart(s) {
+  ch.sym = s.trim().toUpperCase(); ch.data = null; dropView();
+  $("chartSym").textContent = ch.sym;
+  ["chartChg", "chartLegend", "chartNote"].forEach(id => $(id).innerHTML = "");
+  renderRanges();
+  if (!$("chartDlg").open) $("chartDlg").showModal();
+  loadChart();
+  // Refresh every minute while open (the server caches intraday data for 60 s).
+  clearInterval(ch.timer); ch.timer = setInterval(loadChart, 60000);
+}
+
+// One listener for every ticker button: the tables are re-rendered every 3 s, so
+// per-button handlers would have to be re-attached each time.
+document.addEventListener("click", e => { const b = e.target.closest("button.sym"); if (b) openChart(b.dataset.sym); });
+$("ranges").onclick = e => {
+  const b = e.target.closest("button");
+  if (b && b.dataset.range !== ch.range) { ch.range = b.dataset.range; renderRanges(); dropView(); loadChart(); }
+};
+$("chartGo").onsubmit = e => { e.preventDefault(); const v = $("chartInput").value.trim(); if (v) { $("chartInput").value = ""; openChart(v); } };
+$("chartClose").onclick = () => $("chartDlg").close();
+// Closing (✕ or Esc) stops the refresh, cancels any request in flight and frees the chart.
+$("chartDlg").addEventListener("close", () => { clearInterval(ch.timer); ch.req++; dropView(); });
+// Theme switched while open: rebuild with the other theme's colours.
+matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { if (ch.view && ch.data) { dropView(); drawView(ch.data); } });
+
 async function tick() {
-  try { render(await (await fetch("api/state")).json()); }
+  try {
+    render(await (await fetch("api/state")).json());
+    // A link like http://127.0.0.1:8000/#chart=NVDA (optionally &range=6M) opens that
+    // chart once the page has loaded, so a chart can be bookmarked. Read once, then
+    // cleared so later refreshes do not reopen it.
+    const m = location.hash.match(/^#chart=([A-Za-z0-9.\-]+)(?:&range=(\w+))?$/);
+    if (m && CHARTS) {
+      history.replaceState(null, "", location.pathname);
+      if (RANGES.includes(m[2])) ch.range = m[2];
+      openChart(m[1]);
+    }
+  }
   catch (e) { $("status").innerHTML = `<span class="pill"><span class="dot off"></span>Engine not reachable</span>`; }
 }
 tick(); setInterval(tick, 3000); addEventListener("resize", drawChart);

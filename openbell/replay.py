@@ -6,8 +6,10 @@ WHAT: * `contexts_for`   builds each symbol's DailyContext using only data from 
                          the session (also used by the live runner);
       * `replay_session` plays one session's minute bars through the Engine;
       * `pick_watchlist` is the numeric-only scanner path (no news, no agent);
-      * `SyntheticMarket` is a seeded random-walk price generator;
-      * `run_simulation` ties these together for `python -m openbell sim`.
+      * `SyntheticMarket` is a seeded random-walk price generator; its `bars()` mimics
+                         AlpacaData.bars so the dashboard can chart simulated prices;
+      * `run_simulation` ties these together for `python -m openbell sim` and returns
+                         the market, which `sim --serve` hands to the chart service.
 HOW:  Historical data contains only bars, but the engine expects a live-like stream of
       ticks, bars and clock events. `replay_session` recreates that stream: for every
       bar (in time order) it sends four synthetic ticks (O, then L/H, then H/L, then C),
@@ -28,6 +30,10 @@ from .config import Config
 from .engine import Engine
 from .indicators import build_daily_context
 from .models import Bar, Tick, Session, DayPlan
+
+# Minute bars kept per symbol for the dashboard's intraday charts: 7 full sessions,
+# enough for the 5-day chart plus the warm-up session in front of it.
+MINUTES_KEPT = 7 * 390
 
 
 def bar_ticks(b: Bar) -> list:
@@ -95,6 +101,8 @@ class SyntheticMarket:
         self.drift = {s: self.rng.uniform(-0.0002, 0.0012) for s in symbols}
         self.vol = {s: self.rng.uniform(0.012, 0.035) for s in symbols}
         self.daily: dict = {s: [] for s in symbols}   # generated daily bars per symbol
+        # The latest minute bars per symbol, only for charts; the simulation never reads them.
+        self.minutes: dict = {}
 
     def seed_history(self, sessions: list) -> None:
         """Generate one daily bar per symbol per session (the warm-up history that the
@@ -123,6 +131,7 @@ class SyntheticMarket:
         out = []
         n = int((session.close - session.open).total_seconds() // 60)   # 390, or 210 on a half-day
         for s in (symbols if symbols is not None else self.symbols):
+            first = len(out)                  # where this symbol's bars start in `out`
             px = self.px[s] * math.exp(self.rng.gauss(0, self.vol[s] * 0.3))   # opening gap
             # Scale daily volatility to one minute: variance adds up over time, so the
             # per-minute standard deviation is daily_vol / sqrt(minutes per day).
@@ -144,7 +153,21 @@ class SyntheticMarket:
                 day_h, day_l, day_v = max(day_h, h), min(day_l, l), day_v + v
             self.px[s] = px
             self.daily[s].append(Bar(s, _day_ts(session), day_o, day_h, day_l, px, day_v))
+            # Remember today's minutes for the charts, dropping the oldest beyond the cap.
+            # (Uses no random numbers, so simulations stay identical with or without it.)
+            kept = self.minutes.setdefault(s, [])
+            kept.extend(out[first:])
+            del kept[:-MINUTES_KEPT]
         return out
+
+    async def bars(self, symbols: list, timeframe: str, start: datetime, end: datetime,
+                   feed: str = None) -> dict:
+        """Same call as `AlpacaData.bars`, served from memory, so `ChartService` can
+        chart a simulation exactly as it charts live data. Only "1Day" and "1Min" exist
+        (`feed` is ignored). Minute bars exist only for days a symbol was watched, so
+        a name that was merely scanned can have an empty intraday chart."""
+        src = {"1Day": self.daily, "1Min": self.minutes}[timeframe]
+        return {s: [b for b in src.get(s, []) if start <= b.ts < end] for s in symbols}
 
 
 def _day_ts(session: Session) -> datetime:
@@ -169,12 +192,13 @@ def pick_watchlist(cfg: Config, engine: Engine, daily: dict, session: Session) -
 
 
 def run_simulation(cfg: Config, engine: Engine, sessions: list, history: list,
-                   planner: Callable = None, seed: int = 7, universe: int = 60) -> None:
+                   planner: Callable = None, seed: int = 7, universe: int = 60) -> SyntheticMarket:
     """Simulate `sessions` on a synthetic market warmed up over `history`.
 
     Each day: scan -> build contexts -> plan (default unless a planner is given) ->
     generate minute bars for watched names -> advance unwatched names by a daily bar ->
-    replay the session through the engine."""
+    replay the session through the engine. Returns the market, whose bars the
+    dashboard's charts read under `sim --serve`."""
     # Universe = the config symbols plus made-up names SIMAA, SIMAB, ... up to `universe`
     # in total. chr(65) is "A"; i // 26 and i % 26 give two letters, like base-26 digits.
     names = list(dict.fromkeys(cfg.symbols + [f"SIM{chr(65 + i // 26)}{chr(65 + i % 26)}"
@@ -191,3 +215,4 @@ def run_simulation(cfg: Config, engine: Engine, sessions: list, history: list,
         # hole and tomorrow's scan would be wrong.
         mkt.daily_step(sess, [s for s in mkt.symbols if s not in live])
         replay_session(engine, sess, ctx, plan, bars, watch)
+    return mkt

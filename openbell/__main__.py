@@ -66,16 +66,23 @@ def cmd_sim(args) -> int:
     engine = Engine(cfg, journal)
     # The last `days` sessions are traded; the 300 sessions before them only generate
     # price history so the indicators (EMA50, 3-month strength, ...) have data to work on.
-    run_simulation(cfg, engine, sessions[-args.days:], sessions[-args.days - 300:-args.days], seed=args.seed)
+    traded = sessions[-args.days:]
+    mkt = run_simulation(cfg, engine, traded, sessions[-args.days - 300:-args.days], seed=args.seed)
     print(json.dumps({"days": args.days, "equity": round(engine.equity(), 2),
                       "open_positions": len(engine.positions), "stats": journal.stats()}, indent=2))
     if args.serve:
         # Optionally open the dashboard on the finished simulation (blocks until Ctrl+C).
         import uvicorn
         from .api import create_app
+        from .charts import ChartService
+        # Charts read the synthetic bars held in memory by the market. "Now" is the last
+        # simulated close, so the 1D chart shows the last simulated session; no delay and
+        # no feed choice apply to made-up data.
+        charts = ChartService(mkt, cfg, cal, now=lambda: traded[-1].close,
+                              delay=timedelta(0), feed=None)
         print(f"dashboard on http://{cfg.api.host}:{cfg.api.port} (simulated data)")
-        uvicorn.run(create_app(engine, journal, cfg, {}), host=cfg.api.host, port=cfg.api.port,
-                    log_level="warning")
+        uvicorn.run(create_app(engine, journal, cfg, {}, charts), host=cfg.api.host,
+                    port=cfg.api.port, log_level="warning")
     return 0
 
 

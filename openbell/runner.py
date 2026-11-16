@@ -10,7 +10,9 @@ WHAT: `LiveRunner` is the conductor of `python -m openbell run`. It owns one of 
         4. stream live ticks and bars into the engine until
            the close; watch for a silent feed                (trade)
         5. close the day's books and ask for a review        (after_close)
-      The read-only dashboard server runs alongside, on the same event loop.
+      The read-only dashboard server runs alongside, on the same event loop, with a
+      `ChartService` that fetches a symbol's bars from the same AlpacaData client when
+      its chart is opened.
 HOW:  Everything is asyncio: one thread, many cooperating tasks. While one task waits
       on the network (`await`), the others run. The blocking Claude API calls are pushed
       to a worker thread with `asyncio.to_thread` so they cannot freeze the price loop.
@@ -35,6 +37,7 @@ import uvicorn
 from .agent import Agent
 from .alpaca import AlpacaData, FatalFeedError
 from .api import create_app
+from .charts import ChartService
 from .config import Config
 from .engine import Engine
 from .journal import Journal
@@ -80,7 +83,9 @@ class LiveRunner:
 
     async def run(self) -> None:
         """Main loop. Never returns normally; stops on Ctrl+C or a FatalFeedError."""
-        app = create_app(self.engine, self.journal, self.cfg, self.info)
+        # Charts read delayed full-market (SIP) bars on demand; see charts.py.
+        charts = ChartService(self.data, self.cfg, self.cal)
+        app = create_app(self.engine, self.journal, self.cfg, self.info, charts)
         # Run the web server as a task on this same event loop (not a separate process),
         # so it can read the engine's in-memory state directly.
         server = uvicorn.Server(uvicorn.Config(app, host=self.cfg.api.host, port=self.cfg.api.port,

@@ -10,7 +10,7 @@ OpenBell is an autonomous **paper-trading** agent for the US cash session (Pytho
 pip install -r requirements.txt
 python -m pytest -q                                   # full suite, no keys or network needed
 python -m pytest tests/test_engine.py::test_name -q   # single test
-python -m openbell sim --days 20 --serve              # synthetic smoke run + dashboard, no keys
+python -m openbell sim --days 20 --serve              # synthetic smoke run + dashboard (with charts), no keys
 python -m openbell replay --start 2026-09-01 --end 2026-10-30   # real historical minute bars (Alpaca keys)
 python -m openbell doctor                             # checks every external service with real keys
 python -m openbell run                                # live loop, dashboard on 127.0.0.1:8000
@@ -38,6 +38,8 @@ python -m openbell run                                # live loop, dashboard on 
 **Config** (`config.py`): nested dataclasses with defaults; `config.yaml` is merged over them and **unknown keys raise**, so a new setting needs a dataclass field first. Some tunables (e.g. `min_range_bars`, `pullback_atr`, `max_chase_atr`, `premarket_lead_minutes`) exist only as dataclass defaults.
 
 **Dashboard**: `api.py` (FastAPI, read-only, no auth) serves `dashboard.html` and JSON from `engine.snapshot()` and the journal. Keep it bound to localhost.
+
+**Charts** (`charts.py`): `GET /api/chart/{symbol}?range=1D|5D|1M|6M|1Y` returns candles plus EMA (the swing periods), VWAP and volume average, and `overlays()` adds trade markers and position/setup levels from the engine and journal. `ChartService` takes any source with `AlpacaData.bars()`'s signature: the runner passes its `AlpacaData` (SIP feed, data ending 16 min ago, fallback to the configured feed on `FatalFeedError`), and `sim --serve` passes the `SyntheticMarket` that `run_simulation` returns. Intraday ranges fetch 1-minute bars, keep 09:30-16:00 only and merge them into candles aligned to the open. Intraday times are sent as New York wall-clock time encoded as UTC epoch seconds, because the chart library displays UTC. The page draws with Lightweight Charts 4.2.0 from unpkg, and series colours are CSS tokens (`--ema-fast`, `--ema-slow`, `--vwap`). The route is `async` and runs on the trading event loop when live, so it must never block. Charts are display only; never feed them back into the engine.
 
 ## Testing notes
 

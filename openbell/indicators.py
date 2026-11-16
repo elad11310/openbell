@@ -4,6 +4,8 @@ WHAT: `ema` (exponential moving average), `atr` (Average True Range) and
       `build_daily_context`, which turns a symbol's daily history into a
       `models.DailyContext`: yesterday's prices, volatility, trend, recent returns and,
       if present, the swing strategy's buy trigger.
+      `ema_series`, `sma_series` and `vwap_series` return a value for every bar instead
+      of only the latest one; the dashboard's price charts (charts.py) draw them as lines.
 HOW:  Pure arithmetic over lists of completed bars; no I/O, no clock, no state.
       The last bar in the list is treated as "yesterday" (the previous session).
 WHY:  The same function must give the same answer live, in a historical replay, in the
@@ -14,7 +16,7 @@ WHY:  The same function must give the same answer live, in a historical replay, 
 """
 from __future__ import annotations
 
-from typing import Optional, Sequence
+from typing import Callable, Optional, Sequence
 
 from .models import Bar, DailyContext
 from .config import SwingCfg
@@ -37,6 +39,58 @@ def ema(values: Sequence[float], period: int) -> float:
     for v in values[period:]:
         e = v * k + e * (1 - k)
     return e
+
+
+def ema_series(values: Sequence[float], period: int) -> list:
+    """The same EMA as `ema`, but one value per input value (None while warming up).
+
+    Identical seeding and smoothing, so `ema_series(v, p)[-1] == ema(v, p)`: the line a
+    chart draws ends exactly where the strategy's EMA is. The first `period - 1` entries
+    are None because the seed (a simple average of `period` values) is not known yet."""
+    out: list = [None] * len(values)
+    if len(values) < period:
+        return out
+    k = 2.0 / (period + 1)
+    e = sum(values[:period]) / period
+    out[period - 1] = e
+    for i in range(period, len(values)):
+        e = values[i] * k + e * (1 - k)
+        out[i] = e
+    return out
+
+
+def sma_series(values: Sequence[float], period: int) -> list:
+    """Simple moving average per value (None while warming up). Used for the average
+    volume line under the candles: a bar well above it is unusually active.
+    Keeps a running sum (add the newest value, subtract the one leaving the window)
+    instead of re-adding `period` values at every step."""
+    out: list = [None] * len(values)
+    run = 0.0
+    for i, v in enumerate(values):
+        run += v
+        if i >= period:
+            run -= values[i - period]
+        if i >= period - 1:
+            out[i] = run / period
+    return out
+
+
+def vwap_series(bars: Sequence[Bar], key: Callable[[Bar], object]) -> list:
+    """Volume-weighted average price after each bar, restarting whenever `key(bar)`
+    changes (pass the bar's session date, so every session starts a fresh VWAP).
+
+    Same formula as the engine (`IntradayState.vwap`): running sum of typical price
+    (h+l+c)/3 times volume, divided by running volume. None until volume has traded."""
+    out: list = []
+    current, pv, vol = object(), 0.0, 0.0    # object(): a key no bar can equal
+    for b in bars:
+        k = key(b)
+        if k != current:                     # new session: reset the running sums
+            current, pv, vol = k, 0.0, 0.0
+        pv += (b.h + b.l + b.c) / 3 * b.v
+        vol += b.v
+        out.append(pv / vol if vol > 0 else None)
+    return out
 
 
 def atr(bars: Sequence[Bar], period: int) -> float:

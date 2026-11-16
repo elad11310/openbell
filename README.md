@@ -26,6 +26,7 @@ No real orders are ever sent. Fills are simulated inside the app against live pr
 | Journal | `journal.py` | SQLite: positions, cash, trades, events, equity curve. Survives restarts |
 | Runner | `runner.py` | The loop: wait for the session, prepare, trade, review, repeat |
 | Dashboard | `api.py`, `dashboard.html` | Read-only status page, works on a phone |
+| Charts | `charts.py` | Candles, volume, EMA 20/50 and VWAP for any ticker on the dashboard |
 
 **Why the LLM is not in the price loop.** A model call takes seconds and is not
 repeatable; a stop has to act on the next tick, every time. So rules own execution,
@@ -67,6 +68,39 @@ Every candidate is stored in the `scan` table with its metrics, headlines, decis
 reason. Later runs fill in its next-day and 5-day move, and the dashboard shows the
 average for approved versus rejected names, so you can check whether the gate adds value.
 
+## Charts
+
+Click any ticker on the dashboard (positions, watchlist, scan, trades, activity) to open
+its price chart. You can also type a symbol in the chart's box, or open
+`http://127.0.0.1:8000/#chart=NVDA`. Use the 1D, 5D, 1M, 6M and 1Y buttons to change the range.
+
+| Range | Candles | Lines |
+|---|---|---|
+| 1D | 5-minute, today's (or the last) session | EMA 20, EMA 50, session VWAP |
+| 5D | 15-minute, last 5 sessions | EMA 20, EMA 50, session VWAP |
+| 1M, 6M, 1Y | daily | EMA 20, EMA 50 |
+
+- Volume bars sit under the candles with a 20-bar average line.
+- Green arrows mark this app's paper entries and red arrows its exits.
+- Dotted lines show the open position's entry, stop and target, today's swing trigger,
+  and the opening range on intraday charts.
+- The legend shows open, high, low, close, volume and the indicator values under the cursor.
+- The EMA periods are the swing strategy's, so the lines are the ones the engine trades on.
+
+Charts are drawn with TradingView's open-source
+[Lightweight Charts](https://github.com/tradingview/lightweight-charts) library, loaded
+from a CDN. Live charts use Alpaca's full-market (SIP) bars, which the free plan serves
+once they are 15 minutes old, so **live charts end 16 minutes ago** and say so. If your
+account cannot read SIP, charts fall back to the configured feed (IEX), whose volume is
+only one exchange's share.
+
+Under `sim --serve`, charts show the synthetic prices. Intraday bars exist only for
+days a symbol was on the watchlist.
+
+Each chart costs one Alpaca request. It is cached for 60 s (intraday) or 10 min (daily),
+and an open chart refreshes once a minute. Charts are for display only: the engine never
+reads them.
+
 ## Strategies (long only)
 
 - **ORB, intraday.** First 1-minute close above the 15-minute opening range, above
@@ -87,7 +121,7 @@ months of paper results as the test.
 pip install -r requirements.txt
 cp .env.example .env        # Alpaca keys (free paper account); Anthropic and Finnhub keys are optional
 python -m openbell doctor   # checks every outside service with your keys; paste the report if anything fails
-python -m pytest -q         # 38 tests
+python -m pytest -q         # no keys or network needed
 python -m openbell sim --days 20 --serve    # no keys needed: synthetic data + dashboard
 python -m openbell run      # live sessions, paper only; dashboard on http://127.0.0.1:8000
 ```
@@ -131,3 +165,4 @@ is today's most liquid stocks, which flatters the result (survivorship bias).
   without it.
 - An open swing position is not closed ahead of its earnings date; only new entries are blocked.
 - The dashboard has no login. Keep it on localhost or behind a VPN/tunnel.
+- Live charts lag 16 minutes (free full-market data) and need internet access for the chart library.
