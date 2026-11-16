@@ -11,6 +11,7 @@ risk:
   max_position_pct: 20 # largest single position, % of equity
   max_gross_exposure_pct: 100
   max_positions: 15
+  max_swing_positions: 6 # swing's share of max_positions; the rest stay free for ORB
   max_trades_per_day: 8
   daily_loss_limit_pct: 2.0 # stop new entries and flatten intraday trades
   slippage_bps: 2.0 # applied to every simulated fill

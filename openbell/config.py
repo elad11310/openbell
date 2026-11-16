@@ -37,6 +37,10 @@ class RiskCfg:
     max_position_pct: float = 20.0       # % of equity in one name
     max_gross_exposure_pct: float = 100.0  # total market value of positions / equity (100 = no leverage)
     max_positions: int = 15 #6
+    # Swing entries start 5 minutes after the open, before any ORB can (the opening range
+    # ends at 9:45), and swing positions are held for days. Without their own cap they
+    # fill the slots first; this keeps max_positions - max_swing_positions free for ORB.
+    max_swing_positions: int = 6
     max_trades_per_day: int = 8 #8
     daily_loss_limit_pct: float = 2.0    # halt new entries + flatten intraday
     slippage_bps: float = 2.0            # 1 bp = 0.01%; added to buys, taken off sells

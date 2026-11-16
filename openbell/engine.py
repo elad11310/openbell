@@ -9,7 +9,8 @@ WHAT: `Engine` decides when to buy and sell and keeps the books. It runs two lon
           computed pre-market by `indicators.build_daily_context`; 2-ATR stop that then
           trails 3 ATR below the highest close; exits on trend break or after 30 days.
       Every entry passes the hard risk limits from config (risk per trade, position size,
-      exposure, open positions, trades per day, daily loss limit, stale feed).
+      exposure, open positions, open swing positions, trades per day, daily loss limit,
+      stale feed).
       Fills are simulated against the last price plus a fixed slippage.
 
 HOW:  The engine is a pure event processor. It never reads the clock, the network or a
@@ -380,6 +381,10 @@ class Engine:
             why = "data feed stale"
         elif len(self.positions) >= r.max_positions:
             why = "max open positions"
+        elif sig.strategy == "SWING" and self._swing_count() >= r.max_swing_positions:
+            # Swing has its own share of the slots, so early swing triggers cannot use up
+            # the room ORB breakouts need later in the morning.
+            why = "max swing positions"
         elif self.trades_today >= r.max_trades_per_day:
             why = "max trades per day"
         elif self.plan.risk_multiplier <= 0:
@@ -474,8 +479,13 @@ class Engine:
                and now < s.close - timedelta(minutes=ic.no_entry_minutes_before_close))
         c = self.ctx.get(symbol)
         swing = (sw.enabled and allow.allow_swing and c is not None and c.swing_trigger is not None
-                 and (symbol, "SWING") not in self._attempted)
+                 and (symbol, "SWING") not in self._attempted
+                 and self._swing_count() < self.cfg.risk.max_swing_positions)
         return bool(orb or swing)
+
+    def _swing_count(self) -> int:
+        """Open swing positions (for max_swing_positions)."""
+        return sum(p.strategy == "SWING" for p in self.positions.values())
 
     def snapshot(self) -> dict:
         """Everything the dashboard (and the agent's plan prompt) needs, as plain JSON

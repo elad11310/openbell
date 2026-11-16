@@ -251,6 +251,24 @@ def test_max_positions_and_stale_feed(tmp_path):
     assert set(e.positions) == {"BBB"}
 
 
+def test_swing_positions_have_their_own_cap(tmp_path):
+    cfg, j, e = make(tmp_path, max_swing_positions=1)
+    e.start_day(SESS, {"AAA": ctx(trigger=101.0), "BBB": ctx("BBB", trigger=101.0),
+                       "CCC": ctx("CCC", trigger=101.0)}, DayPlan(), ["AAA", "BBB", "CCC"])
+    e.on_tick(Tick("AAA", OPEN + timedelta(minutes=6), 101.2))     # takes the only swing slot
+    e.on_tick(Tick("BBB", OPEN + timedelta(minutes=6), 101.2))     # swing refused...
+    assert set(e.positions) == {"AAA"}
+    assert j.rows("SELECT message FROM events WHERE kind='SKIP'")[0]["message"] == "SWING: max swing positions"
+    feed_opening_range(e, "BBB")
+    e.on_bar(bar(15, 100.5, 101.6, 100.4, 101.5, v=2000, sym="BBB"))   # ...but its ORB still enters
+    assert e.positions["BBB"].strategy == "ORB"
+    # The feed planner sees the cap too: CCC's ORB is used, and no swing slot is free.
+    e.state["CCC"].orb_taken = True
+    assert not e.can_still_enter("CCC")
+    cfg.risk.max_swing_positions = 2
+    assert e.can_still_enter("CCC")
+
+
 # ---------------------------------------------------------------- durability
 def test_restart_restores_state_and_day_counters(tmp_path):
     cfg, j, e = make(tmp_path)

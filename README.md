@@ -149,6 +149,13 @@ reads them.
   far past it. Stop 2 ATR, then a 3 ATR trail from the highest close. Exits at the
   open after a close below EMA50 or after 30 days.
 
+**Slots.** At most `risk.max_positions` (15) positions are open at once, and at most
+`risk.max_swing_positions` (6) of them are swing. Swing entries can start at 9:35 and ORB
+entries only after the opening range ends at 9:45. Swing positions also stay open for days.
+Without their own cap, swing positions would fill every slot before an ORB breakout could
+use one. Above the cap, new swing signals are skipped with "max swing positions" in the
+activity log. Open swing positions are not sold to make room.
+
 These are sensible, well-known rule sets, not a proven edge. Treat the first
 months of paper results as the test.
 
